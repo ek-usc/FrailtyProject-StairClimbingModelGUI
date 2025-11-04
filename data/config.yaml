@@ -1,0 +1,20 @@
+﻿visualization:
+  figure_width: 14
+  figure_height: 8
+  animation_fps: 30
+
+muscles:
+  groups:
+    hip_extensors: [glut_max, biceps_fem_lh, semitend, semimem]
+    quadriceps: [rectus_fem, vast_lat, vast_med, vast_int]
+    calf: [gastroc_med, gastroc_lat, soleus]
+    hip_flexors: [iliacus, rectus_fem]
+
+frailty:
+  threshold_multiplier: 1.1  # times body weight
+
+colors:
+  hip_extensors: "#8B0000"
+  quadriceps: "#FFD700"
+  calf: "#4169E1"
+  hip_flexors: "#228B22"
