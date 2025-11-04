@@ -14,6 +14,14 @@
 #   force_polytopes:
 #       polytopes.npz
 #   config.yaml
+#
+# Generative AI was used to provide a workflow framework and assist with coding.
+# Prompt: "[We are] trying to model the human lower limb to study the diminishing feasible output forces and parameters as a person grows elderly, framing the problem in the context of what [we] learned in class (see the attached textbook pdf), especially about torque, force, and muscle activation spaces.
+# Also attached is a pdf compiling [our] research notes, resources, and tasks.
+# Describe thoroughly, the GUI producer's role, and outline their workflow steps:
+# "The other to write a script to visualize the output-figures to a video (for example, make a GUI, Users can choose muscles they interested in, then by dragging the progress bar, users can choose each leg posture, and corresponding feasible force set will appear next to the posture)."
+# Make sure to also describe the required input parameters that the script will accept and read, before producing the user-interactive GUI.
+# Also consider some useful, extra features for the GUI."
 
 
 """
