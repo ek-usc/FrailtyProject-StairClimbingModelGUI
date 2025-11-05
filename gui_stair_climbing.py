@@ -27,6 +27,8 @@
 """
 Lower Limb Force Capacity Visualization GUI
 Frailty - Stair Climbing Analysis
+Uses normalized gait cycle percentage for cross-source compatibility
+UPDATED: Uses actual moment arm matrix with signed values
 """
 
 import numpy as np
@@ -90,7 +92,18 @@ class DataLoader:
         # Load kinematics
         joint_file = self.data_path / "kinematics" / "joint_angles.csv"
         self.kinematics = pd.read_csv(joint_file)
-        print(f"✓ Loaded kinematics: {len(self.kinematics)} time points")
+
+        # Detect which column name is used (time or gait_percent)
+        if 'gait_percent' in self.kinematics.columns:
+            self.time_col = 'gait_percent'
+            self.time_units = '%'
+            print(f"✓ Loaded kinematics: {len(self.kinematics)} gait cycle points (normalized format)")
+        elif 'time' in self.kinematics.columns:
+            self.time_col = 'time'
+            self.time_units = 's'
+            print(f"✓ Loaded kinematics: {len(self.kinematics)} time points (absolute time format)")
+        else:
+            raise ValueError("Kinematics file must have either 'time' or 'gait_percent' column")
 
         # Load segment lengths
         segment_file = self.data_path / "kinematics" / "segment_lengths.json"
@@ -130,16 +143,16 @@ class DataLoader:
 
     def validate_data(self):
         """Validate data consistency"""
-        n_time_points = len(self.kinematics)
+        n_points = len(self.kinematics)
 
-        assert len(self.activations) == n_time_points, \
-            f"Activation data length mismatch: {len(self.activations)} vs {n_time_points}"
-        assert len(self.forces) == n_time_points, \
-            f"Force data length mismatch: {len(self.forces)} vs {n_time_points}"
+        assert len(self.activations) == n_points, \
+            f"Activation data length mismatch: {len(self.activations)} vs {n_points}"
+        assert len(self.forces) == n_points, \
+            f"Force data length mismatch: {len(self.forces)} vs {n_points}"
 
         # Check muscle names consistency
         muscle_names = self.muscles.index.tolist()
-        act_muscles = [col for col in self.activations.columns if col != 'time']
+        act_muscles = [col for col in self.activations.columns if col != self.time_col]
 
         missing_in_act = set(muscle_names) - set(act_muscles)
         if missing_in_act:
@@ -176,8 +189,7 @@ class LegModel:
         knee = np.array([knee_x, knee_y])
 
         # Ankle position
-        # Knee angle is relative to thigh
-        shank_angle = hip_rad + knee_rad
+        shank_angle = hip_rad - knee_rad
         ankle_x = knee_x + self.shank_length * np.sin(shank_angle)
         ankle_y = knee_y - self.shank_length * np.cos(shank_angle)
         ankle = np.array([ankle_x, ankle_y])
@@ -198,33 +210,50 @@ class PolytopeComputer:
     def __init__(self, muscle_params, segment_lengths):
         self.muscle_params = muscle_params
         self.body_weight = segment_lengths['subject_mass'] * 9.81
+        # Store segment lengths
+        self.segment_lengths = segment_lengths
 
     def compute_jacobian(self, hip_angle, knee_angle, ankle_angle,
-                        thigh_length, shank_length):
+                         thigh_length, shank_length):
         """
-        Compute Jacobian matrix J: maps joint torques to endpoint forces
-        J is 2x3 (Fx, Fy) = J^-T * (tau_hip, tau_knee, tau_ankle)
+        Compute Jacobian matrix J: maps joint velocities to endpoint velocities
+        [v_x, v_y]^T = J * [θ̇_hip, θ̇_knee, θ̇_ankle]^T
 
-        Simplified 2D planar model
+        For force analysis: F_endpoint = J^-T * τ_joint
+
+        Angle conventions:
+        - hip_angle: from vertical, positive = forward (CCW)
+        - knee_angle: flexion angle (relative to thigh), positive = bending
+        - ankle_angle: relative to shank
         """
         # Convert to radians
         theta1 = np.radians(hip_angle)
         theta2 = np.radians(knee_angle)
+        theta3 = np.radians(ankle_angle)
 
-        # Simplified Jacobian for 2D leg
         l1 = thigh_length
         l2 = shank_length
+        l3 = self.segment_lengths['foot_length']  # Access from stored dict
 
+        # Shank angle (absolute from vertical)
+        theta_shank = theta1 - theta2
+
+        # Foot angle (absolute from vertical)
+        theta_foot = theta_shank + theta3
+
+        # Jacobian for toe position (2D endpoint)
+        # Rows are [x, y], columns are [hip, knee, ankle]
         J = np.array([
-            [-l1*np.cos(theta1) - l2*np.cos(theta1+theta2),
-             -l2*np.cos(theta1+theta2)],
-            [-l1*np.sin(theta1) - l2*np.sin(theta1+theta2),
-             -l2*np.sin(theta1+theta2)]
-        ])
+            # ∂x/∂θ_hip, ∂x/∂θ_knee, ∂x/∂θ_ankle
+            [l1 * np.cos(theta1) + l2 * np.cos(theta_shank) + l3 * np.cos(theta_foot),
+             -l2 * np.cos(theta_shank) - l3 * np.cos(theta_foot),
+             -l3 * np.cos(theta_foot)],
 
-        # Add ankle column (simplified)
-        J = np.column_stack([J, np.array([-0.1*np.cos(theta1+theta2),
-                                          -0.1*np.sin(theta1+theta2)])])
+            # ∂y/∂θ_hip, ∂y/∂θ_knee, ∂y/∂θ_ankle
+            [l1 * np.sin(theta1) + l2 * np.sin(theta_shank) + l3 * np.sin(theta_foot),
+             l2 * np.sin(theta_shank) + l3 * np.sin(theta_foot),
+             l3 * np.sin(theta_foot)]
+        ])
 
         return J
 
@@ -317,7 +346,17 @@ class StairClimbingGUI:
 
     def __init__(self, root, data_loader):
         self.root = root
-        self.root.title("Lower Limb Force Capacity - Stair Climbing Analysis")
+
+        # Store time column info from data loader
+        self.time_col = data_loader.time_col
+        self.time_units = data_loader.time_units
+
+        # Set appropriate title based on format
+        if self.time_col == 'gait_percent':
+            title = "Lower Limb Force Capacity - Stair Climbing Analysis (Normalized Gait Cycle)"
+        else:
+            title = "Lower Limb Force Capacity - Stair Climbing Analysis"
+        self.root.title(title)
 
         self.data = data_loader
         self.leg_model = LegModel(data_loader.segment_lengths)
@@ -340,8 +379,8 @@ class StairClimbingGUI:
         # Default view limits (zoomed out 0.5x = 2x range, panned down 500 N)
         self.default_leg_xlim = [-0.6, 0.6]
         self.default_leg_ylim = [-1.2, 0.2]
-        self.default_polytope_xlim = [-1000, 1000]
-        self.default_polytope_ylim = [-1800, 2600]
+        self.default_polytope_xlim = [-500, 300]
+        self.default_polytope_ylim = [-500, 1500]
 
         # Current view limits (will be updated by user pan/zoom)
         self.current_leg_xlim = self.default_leg_xlim.copy()
@@ -368,38 +407,38 @@ class StairClimbingGUI:
             ]
 
             if len(muscle_data) > 0:
-                times = muscle_data['time'].values
+                time_vals = muscle_data[self.time_col].values
                 hip_ma = muscle_data['hip_moment_arm'].values
                 knee_ma = muscle_data['knee_moment_arm'].values
                 ankle_ma = muscle_data['ankle_moment_arm'].values
 
                 # Create interpolation functions
-                if len(times) > 1:
+                if len(time_vals) > 1:
                     self.moment_arm_dict[muscle] = {
-                        'hip': interp1d(times, hip_ma, fill_value='extrapolate'),
-                        'knee': interp1d(times, knee_ma, fill_value='extrapolate'),
-                        'ankle': interp1d(times, ankle_ma, fill_value='extrapolate'),
+                        'hip': interp1d(time_vals, hip_ma, fill_value='extrapolate'),
+                        'knee': interp1d(time_vals, knee_ma, fill_value='extrapolate'),
+                        'ankle': interp1d(time_vals, ankle_ma, fill_value='extrapolate'),
                     }
                 else:
-                    # Single time point - use constant value
+                    # Single point - use constant value
                     self.moment_arm_dict[muscle] = {
-                        'hip': lambda t: hip_ma[0],
-                        'knee': lambda t: knee_ma[0],
-                        'ankle': lambda t: ankle_ma[0],
+                        'hip': lambda t, val=hip_ma[0]: val,
+                        'knee': lambda t, val=knee_ma[0]: val,
+                        'ankle': lambda t, val=ankle_ma[0]: val,
                     }
 
-    def get_moment_arms(self, time_idx):
-        """Get moment arms at specific time index"""
-        time = self.data.kinematics.iloc[time_idx]['time']
+    def get_moment_arms(self, frame_idx):
+        """Get moment arms at specific frame index"""
+        time_val = self.data.kinematics.iloc[frame_idx][self.time_col]
         ma_dict = {}
 
         for muscle in self.muscle_names:
             if muscle in self.moment_arm_dict:
                 try:
                     ma_dict[muscle] = [
-                        float(self.moment_arm_dict[muscle]['hip'](time)),
-                        float(self.moment_arm_dict[muscle]['knee'](time)),
-                        float(self.moment_arm_dict[muscle]['ankle'](time))
+                        float(self.moment_arm_dict[muscle]['hip'](time_val)),
+                        float(self.moment_arm_dict[muscle]['knee'](time_val)),
+                        float(self.moment_arm_dict[muscle]['ankle'](time_val))
                     ]
                 except:
                     ma_dict[muscle] = [0.0, 0.0, 0.0]
@@ -498,12 +537,12 @@ class StairClimbingGUI:
         ttk.Button(btn_frame, text="None",
                   command=self.deselect_all_muscles).pack(side=tk.LEFT)
 
-        # Time slider
-        slider_frame = ttk.LabelFrame(control_frame, text="Posture", padding=10)
+        # Time/Gait cycle slider
+        slider_label = "Gait Cycle Position" if self.time_col == 'gait_percent' else "Time Position"
+        slider_frame = ttk.LabelFrame(control_frame, text=slider_label, padding=10)
         slider_frame.pack(fill=tk.X, pady=(0, 10))
 
-        self.time_label = ttk.Label(slider_frame,
-                                    text=f"Time: 0.000 s (0%)")
+        self.time_label = ttk.Label(slider_frame, text=f"Position: 0.0{self.time_units}")
         self.time_label.pack()
 
         self.phase_label = ttk.Label(slider_frame, text="Phase: Heel Strike",
@@ -707,7 +746,7 @@ class StairClimbingGUI:
 
                 # Get frame data
                 row = self.data.kinematics.iloc[frame]
-                time = row['time']
+                time_val = row[self.time_col]
                 hip_angle = row['hip_angle']
                 knee_angle = row['knee_angle']
                 ankle_angle = row['ankle_angle']
@@ -746,13 +785,16 @@ class StairClimbingGUI:
                     if muscle in activations:
                         activation = activations[muscle]
 
-                        if 'glut' in muscle or 'iliacus' in muscle:
+                        if 'glut' in muscle or 'iliacus' in muscle or 'add' in muscle:
                             start = hip + np.array([-0.05, 0.05])
                             end = (hip + knee) / 2
-                        elif 'vast' in muscle or 'rectus' in muscle:
+                        elif 'biceps' in muscle or 'semi' in muscle:
                             start = (hip + knee) / 2
                             end = knee
                         elif 'gastroc' in muscle or 'soleus' in muscle:
+                            start = knee
+                            end = ankle
+                        elif 'tib' in muscle or 'peron' in muscle:
                             start = knee
                             end = ankle
                         else:
@@ -768,8 +810,13 @@ class StairClimbingGUI:
                 ax_leg_export.text(knee[0]-0.1, knee[1]+0.05, 'Knee', fontsize=9)
                 ax_leg_export.text(ankle[0]-0.1, ankle[1]+0.05, 'Ankle', fontsize=9)
 
-                # Add time annotation
-                ax_leg_export.text(0.02, 0.98, f"Time: {time:.3f} s\nPhase: {phase}",
+                # Add time/gait cycle annotation
+                if self.time_col == 'gait_percent':
+                    time_text = f"Gait Cycle: {time_val:.1f}%\nPhase: {phase}"
+                else:
+                    time_text = f"Time: {time_val:.3f} s\nPhase: {phase}"
+
+                ax_leg_export.text(0.02, 0.98, time_text,
                                   transform=ax_leg_export.transAxes,
                                   verticalalignment='top',
                                   bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
@@ -831,11 +878,11 @@ class StairClimbingGUI:
 
             # Save animation
             if file_ext == '.gif':
-                writer = PillowWriter(fps=30)
+                writer = PillowWriter(fps=20)
                 anim.save(filename, writer=writer)
             else:  # .mp4 or others
                 try:
-                    writer = FFMpegWriter(fps=30, bitrate=2000)
+                    writer = FFMpegWriter(fps=20, bitrate=2000)
                     anim.save(filename, writer=writer)
                 except Exception as e:
                     # Fallback to Pillow if FFmpeg not available
@@ -845,7 +892,7 @@ class StairClimbingGUI:
                         "Install FFmpeg for MP4 export."
                     )
                     gif_filename = str(Path(filename).with_suffix('.gif'))
-                    writer = PillowWriter(fps=30)
+                    writer = PillowWriter(fps=20)
                     anim.save(gif_filename, writer=writer)
                     filename = gif_filename
 
@@ -879,15 +926,17 @@ class StairClimbingGUI:
 
         # Get current data
         row = self.data.kinematics.iloc[self.current_frame]
-        time = row['time']
+        time_val = row[self.time_col]
         hip_angle = row['hip_angle']
         knee_angle = row['knee_angle']
         ankle_angle = row['ankle_angle']
         phase = row['phase']
 
-        # Update labels
-        progress = 100 * self.current_frame / (self.n_frames - 1) if self.n_frames > 1 else 0
-        self.time_label.config(text=f"Time: {time:.3f} s ({progress:.1f}%)")
+        # Update labels with proper formatting
+        if self.time_col == 'gait_percent':
+            self.time_label.config(text=f"Gait Cycle: {time_val:.1f}%")
+        else:
+            self.time_label.config(text=f"Time: {time_val:.3f} s")
         self.phase_label.config(text=f"Phase: {phase.replace('_', ' ').title()}")
 
         # Get selected muscles
@@ -934,16 +983,20 @@ class StairClimbingGUI:
                 activation = activations[muscle]
 
                 # Determine muscle attachment points (simplified)
-                if 'glut' in muscle or 'iliacus' in muscle:
+                if 'glut' in muscle or 'iliacus' in muscle or 'add' in muscle:
                     # Hip muscles
                     start = hip + np.array([-0.05, 0.05])
                     end = (hip + knee) / 2
-                elif 'vast' in muscle or 'rectus' in muscle:
-                    # Quadriceps
+                elif 'biceps' in muscle or 'semi' in muscle:
+                    # Hamstrings
                     start = (hip + knee) / 2
                     end = knee
                 elif 'gastroc' in muscle or 'soleus' in muscle:
                     # Calf
+                    start = knee
+                    end = ankle
+                elif 'tib' in muscle or 'peron' in muscle:
+                    # Ankle muscles
                     start = knee
                     end = ankle
                 else:
@@ -1021,9 +1074,16 @@ class StairClimbingGUI:
 
         # === UPDATE INFO TEXT ===
         self.info_text.delete(1.0, tk.END)
+
+        # Format time/gait display
+        if self.time_col == 'gait_percent':
+            time_display = f"Gait Cycle: {time_val:.1f}%"
+        else:
+            time_display = f"Time: {time_val:.3f} s"
+
         info = f"""
 Frame: {self.current_frame}/{self.n_frames-1}
-Time: {time:.3f} s
+{time_display}
 Phase: {phase}
 
 Joint Angles:
@@ -1040,7 +1100,7 @@ Muscles: {len(selected_muscles)}/{len(self.muscle_names)}
 
 
 def generate_sample_data():
-    """Generate sample data files for testing"""
+    """Generate sample data files with actual moment arm matrix values"""
 
     data_path = Path("data")
 
@@ -1055,70 +1115,129 @@ def generate_sample_data():
     (data_path / "moment_arms").mkdir(exist_ok=True)
     (data_path / "kinematics").mkdir(exist_ok=True)
 
-    print("Generating sample data files...")
+    print("Generating sample data files with actual moment arm matrix...")
 
-    # Sample muscle parameters
+    # ACTUAL MOMENT ARM MATRIX - Only these 14 muscles
     muscles = [
         'iliacus', 'glut_max', 'glut_med', 'add_long',
         'biceps_fem_lh', 'biceps_fem_sh', 'semitend', 'semimem',
-        'rectus_fem', 'vast_lat', 'vast_med', 'vast_int',
-        'gastroc_med', 'gastroc_lat', 'soleus',
-        'tib_ant', 'tib_post', 'peron_brev'
+        'tib_ant', 'peron_brev',
+        'gastroc_med', 'gastroc_lat', 'soleus', 'tib_post'
     ]
+
+    # Actual signed moment arm values from the matrix (in meters)
+    # Format: [hip, knee, ankle] for each muscle
+    actual_moment_arms = {
+        'iliacus':       [+0.0150, +0.0000, +0.0000],
+        'glut_max':      [-0.0198, +0.0000, +0.0000],
+        'glut_med':      [+0.0235, +0.0000, +0.0000],
+        'add_long':      [0.0000, +0.0000, +0.0000],  # NA in original, using 0.0
+        'biceps_fem_lh': [-0.0366, +0.0306, +0.0000],
+        'biceps_fem_sh': [+0.0000, +0.0325, +0.0000],
+        'semitend':      [-0.0408, +0.0412, +0.0000],
+        'semimem':       [-0.0380, +0.0363, +0.0000],
+        'tib_ant':       [+0.0000, -0.0170, +0.0170],
+        'peron_brev':    [+0.0000, -0.0113, +0.0113],
+        'gastroc_med':   [+0.0000, -0.0389, +0.0241],
+        'gastroc_lat':   [+0.0000, -0.0386, +0.0254],
+        'soleus':        [+0.0000, +0.0000, +0.0219],
+        'tib_post':      [+0.0000, +0.0000, +0.0081]
+    }
 
     muscle_params = pd.DataFrame({
         'muscle_name': muscles,
         'F0_max': [1000, 1500, 800, 600, 900, 600, 900, 1100,
-                   1200, 2000, 1800, 1900, 1600, 1400, 4000,
-                   1200, 1400, 500],
+                   1200, 500, 1600, 1400, 4000, 1400],
         'optimal_fiber_length': [0.10, 0.14, 0.09, 0.11, 0.11, 0.10,
-                                0.20, 0.08, 0.08, 0.08, 0.09, 0.09,
-                                0.05, 0.06, 0.03, 0.10, 0.03, 0.05],
+                                0.20, 0.08, 0.10, 0.05, 0.05, 0.06, 0.03, 0.03],
         'tendon_slack_length': [0.09, 0.13, 0.08, 0.10, 0.34, 0.10,
-                               0.26, 0.35, 0.35, 0.16, 0.13, 0.14,
-                               0.41, 0.39, 0.27, 0.22, 0.31, 0.16],
+                               0.26, 0.35, 0.22, 0.16, 0.41, 0.39, 0.27, 0.31],
         'pennation_angle': [0.13, 0.09, 0.15, 0.10, 0.00, 0.40,
-                           0.09, 0.26, 0.09, 0.09, 0.09, 0.06,
-                           0.30, 0.15, 0.44, 0.09, 0.21, 0.09],
-        'PCSA': [45, 65, 35, 28, 32, 25, 33, 40, 42, 70, 65, 68,
-                 58, 52, 140, 42, 48, 18]
+                           0.09, 0.26, 0.09, 0.09, 0.30, 0.15, 0.44, 0.21],
+        'PCSA': [45, 65, 35, 28, 32, 25, 33, 40, 42, 18,
+                 58, 52, 140, 48]
     })
     muscle_params.set_index('muscle_name', inplace=True)
     muscle_params.to_csv(data_path / "muscle_data" / "muscle_parameters.csv")
-    print(f"✓ Created muscle_parameters.csv")
+    print(f"✓ Created muscle_parameters.csv with {len(muscles)} muscles")
 
-    # Generate time series (1 second, 150 samples)
-    n_samples = 150
-    time = np.linspace(0, 1, n_samples)
+    # Generate normalized gait cycle (0-100%, 101 samples for 0, 1, 2, ... 100%)
+    n_samples = 101
+    gait_percent = np.linspace(0, 100, n_samples)
 
-    # Joint angles (simplified stair climbing pattern)
-    hip_angles = -20 + 15 * np.sin(2 * np.pi * time)
-    knee_angles = 5 + 60 * (np.sin(2 * np.pi * time - np.pi/4) + 1) / 2
-    ankle_angles = -10 + 20 * np.sin(2 * np.pi * time + np.pi/2)
+    # Joint angles for stair climbing
+    # Based on biomechanics literature (Protopapadaki et al. 2007, Reeves et al. 2009)
+    gait_norm = gait_percent / 100.0
 
-    # Phase labels
+    # Divide gait cycle into phases
+    # Stance: 0-60%, Swing: 60-100%
+    stance_phase = gait_norm < 0.6
+    swing_phase = gait_norm >= 0.6
+
+    # Initialize arrays
+    hip_angles = np.zeros_like(gait_norm)
+    knee_angles = np.zeros_like(gait_norm)
+    ankle_angles = np.zeros_like(gait_norm)
+
+    for i, t in enumerate(gait_norm):
+        if t < 0.1:  # Heel strike (0-10%): foot contacts next step
+            hip_angles[i] = 30 + 10 * (t / 0.1)  # 30-40° flexion
+            knee_angles[i] = 70 + 10 * (t / 0.1)  # 70-80° flexion
+            ankle_angles[i] = 5 * (t / 0.1)  # 0-5° dorsiflexion
+
+        elif t < 0.25:  # Loading response (10-25%): weight acceptance
+            progress = (t - 0.1) / 0.15
+            hip_angles[i] = 40 - 5 * progress  # 40-35° (slight extension)
+            knee_angles[i] = 80 - 20 * progress  # 80-60° (controlled lowering)
+            ankle_angles[i] = 5 - 10 * progress  # 5 to -5° plantarflexion
+
+        elif t < 0.45:  # Mid-stance (25-45%): body rises over foot
+            progress = (t - 0.25) / 0.20
+            hip_angles[i] = 35 - 20 * progress  # 35-15° (extending)
+            knee_angles[i] = 60 - 30 * progress  # 60-30° (extending)
+            ankle_angles[i] = -5 + 10 * progress  # -5 to +5° dorsiflexion
+
+        elif t < 0.60:  # Terminal stance/Push-off (45-60%): propulsion
+            progress = (t - 0.45) / 0.15
+            hip_angles[i] = 15 - 10 * progress  # 15-5° (nearly upright)
+            knee_angles[i] = 30 - 20 * progress  # 30-10° (nearly straight)
+            ankle_angles[i] = 5 - 30 * progress  # +5 to -25° (strong plantarflexion)
+
+        elif t < 0.75:  # Initial swing (60-75%): leg lifts off, starts forward
+            progress = (t - 0.60) / 0.15
+            hip_angles[i] = 5 + 20 * progress  # 5-25° (rapid flexion)
+            knee_angles[i] = 10 + 60 * progress  # 10-70° (rapid flexion)
+            ankle_angles[i] = -25 + 30 * progress  # -25 to +5° (return to neutral)
+
+        else:  # Terminal swing (75-100%): leg reaches forward to next step
+            progress = (t - 0.75) / 0.25
+            hip_angles[i] = 25 + 10 * progress  # 25-35° (continue flexion)
+            knee_angles[i] = 70 + 5 * progress  # 70-75° (maintain flexion)
+            ankle_angles[i] = 5 - 5 * progress  # +5 to 0° (prepare for contact)
+
+    # Phase labels based on gait percentage
     phases = []
-    for t in time:
-        if t < 0.15:
+    for pct in gait_percent:
+        if pct < 15:
             phases.append('heel_strike')
-        elif t < 0.3:
+        elif pct < 30:
             phases.append('loading')
-        elif t < 0.6:
+        elif pct < 60:
             phases.append('mid_stance')
-        elif t < 0.8:
+        elif pct < 80:
             phases.append('push_off')
         else:
             phases.append('swing')
 
     kinematics = pd.DataFrame({
-        'time': time,
+        'gait_percent': gait_percent,
         'hip_angle': hip_angles,
         'knee_angle': knee_angles,
         'ankle_angle': ankle_angles,
         'phase': phases
     })
     kinematics.to_csv(data_path / "kinematics" / "joint_angles.csv", index=False)
-    print(f"✓ Created joint_angles.csv")
+    print(f"✓ Created joint_angles.csv (normalized 0-100%)")
 
     # Segment lengths
     segments = {
@@ -1131,62 +1250,40 @@ def generate_sample_data():
     segment_file = data_path / "kinematics" / "segment_lengths.json"
     with open(segment_file, 'w') as f:
         json.dump(segments, f, indent=2)
-    # Verify file was written
     with open(segment_file, 'r') as f:
         verify = f.read()
     print(f"✓ Created segment_lengths.json ({len(verify)} bytes)")
 
-    # Generate moment arms (simplified)
+    # Generate moment arms using ACTUAL VALUES from matrix
+    # Since we have constant values, we replicate them across all gait cycle points
     ma_data = []
-    for t in time:
+    for pct in gait_percent:
         for muscle in muscles:
-            # Simplified moment arm patterns
-            if 'glut' in muscle:
-                hip_ma = -0.05
-                knee_ma = 0.0
-                ankle_ma = 0.0
-            elif 'vast' in muscle or 'rectus' in muscle:
-                hip_ma = 0.02 if 'rectus' in muscle else 0.0
-                knee_ma = 0.045
-                ankle_ma = 0.0
-            elif 'gastroc' in muscle:
-                hip_ma = 0.0
-                knee_ma = -0.02
-                ankle_ma = 0.05
-            elif 'soleus' in muscle:
-                hip_ma = 0.0
-                knee_ma = 0.0
-                ankle_ma = 0.05
-            elif 'iliacus' in muscle:
-                hip_ma = 0.065
-                knee_ma = 0.0
-                ankle_ma = 0.0
-            else:
-                hip_ma = 0.0
-                knee_ma = 0.0
-                ankle_ma = 0.0
-
+            ma_values = actual_moment_arms[muscle]
             ma_data.append({
-                'time': t,
+                'gait_percent': pct,
                 'muscle': muscle,
-                'hip_moment_arm': hip_ma,
-                'knee_moment_arm': knee_ma,
-                'ankle_moment_arm': ankle_ma
+                'hip_moment_arm': ma_values[0],
+                'knee_moment_arm': ma_values[1],
+                'ankle_moment_arm': ma_values[2]
             })
 
     ma_df = pd.DataFrame(ma_data)
     ma_df.to_csv(data_path / "moment_arms" / "moment_arm_matrix.csv", index=False)
-    print(f"✓ Created moment_arm_matrix.csv")
+    print(f"✓ Created moment_arm_matrix.csv with ACTUAL signed values")
 
     # Generate activations (simplified patterns)
-    activation_data = {'time': time}
+    activation_data = {'gait_percent': gait_percent}
     for muscle in muscles:
-        if 'glut' in muscle or 'vast' in muscle or 'soleus' in muscle:
+        if 'glut' in muscle or 'soleus' in muscle or 'gastroc' in muscle:
             # High during stance
-            activation_data[muscle] = 0.2 + 0.6 * (np.sin(2*np.pi*time - np.pi/2) + 1) / 2
+            activation_data[muscle] = 0.2 + 0.6 * (np.sin(2*np.pi*gait_norm - np.pi/2) + 1) / 2
         elif 'iliacus' in muscle or 'tib_ant' in muscle:
             # High during swing
-            activation_data[muscle] = 0.1 + 0.5 * (np.sin(2*np.pi*time + np.pi/2) + 1) / 2
+            activation_data[muscle] = 0.1 + 0.5 * (np.sin(2*np.pi*gait_norm + np.pi/2) + 1) / 2
+        elif 'biceps' in muscle or 'semi' in muscle:
+            # Hamstrings - high during loading and push-off
+            activation_data[muscle] = 0.2 + 0.5 * (np.sin(2*np.pi*gait_norm - np.pi/3) + 1) / 2
         else:
             activation_data[muscle] = 0.1 + 0.3 * np.random.rand(n_samples)
 
@@ -1196,7 +1293,7 @@ def generate_sample_data():
     print(f"✓ Created activation_timeseries.csv")
 
     # Generate forces
-    force_data = {'time': time}
+    force_data = {'gait_percent': gait_percent}
     for muscle in muscles:
         f_max = muscle_params.loc[muscle, 'F0_max']
         force_data[muscle] = activation_data[muscle] * f_max
@@ -1205,20 +1302,21 @@ def generate_sample_data():
     forces.to_csv(data_path / "muscle_data" / "muscle_forces.csv", index=False)
     print(f"✓ Created muscle_forces.csv")
 
-    # Config file
+    # Config file with updated muscle groups
     config = {
         'visualization': {
             'figure_width': 14,
             'figure_height': 8,
-            'animation_fps': 30
+            'animation_fps': 20
         },
         'muscles': {
             'groups': {
                 'hip_extensors': ['glut_max', 'biceps_fem_lh', 'semitend', 'semimem'],
-                'quadriceps': ['rectus_fem', 'vast_lat', 'vast_med', 'vast_int'],
+                'hip_flexors': ['iliacus'],
+                'hip_stabilizers': ['glut_med', 'add_long'],
+                'knee_extensors': ['biceps_fem_sh'],
                 'calf': ['gastroc_med', 'gastroc_lat', 'soleus'],
-                'hip_flexors': ['iliacus', 'rectus_fem'],
-                'stabilizers': ['glut_med', 'tib_ant']
+                'ankle_stabilizers': ['tib_ant', 'tib_post', 'peron_brev']
             }
         },
         'frailty': {
@@ -1226,10 +1324,15 @@ def generate_sample_data():
         },
         'colors': {
             'hip_extensors': '#8B0000',
-            'quadriceps': '#FFD700',
-            'calf': '#4169E1',
             'hip_flexors': '#228B22',
-            'stabilizers': '#9932CC'
+            'hip_stabilizers': '#9932CC',
+            'knee_extensors': '#FFD700',
+            'calf': '#4169E1',
+            'ankle_stabilizers': '#FF8C00'
+        },
+        'gait_cycle': {
+            'description': 'Data normalized to 0-100% gait cycle',
+            'note': 'Moment arms from actual experimental data with signs'
         }
     }
 
@@ -1237,7 +1340,9 @@ def generate_sample_data():
         yaml.dump(config, f, default_flow_style=False)
     print(f"✓ Created config.yaml")
 
-    print("\n✓ Sample data generated successfully!")
+    print("\n✓ Sample data generated successfully with ACTUAL moment arm matrix!")
+    print(f"  Using {len(muscles)} muscles with signed moment arm values")
+    print("  All datasets use gait_percent (0-100%)")
 
 
 def main():
@@ -1251,7 +1356,7 @@ def main():
         print("Missing or empty data files:")
         for f in missing:
             print(f"  - {f}")
-        print("\nGenerating sample data...")
+        print("\nGenerating sample data with actual moment arm matrix...")
         generate_sample_data()
         print("")
 
@@ -1273,8 +1378,22 @@ def main():
     print("\n" + "="*60)
     print("GUI Started Successfully!")
     print("="*60)
+
+    # Show which format is being used
+    if data_loader.time_col == 'gait_percent':
+        print("\nData Format: Normalized Gait Cycle (0-100%)")
+        print("  ✓ Compatible with multi-source data")
+        print("  ✓ Speed-independent analysis")
+    else:
+        print("\nData Format: Absolute Time (seconds)")
+        print("  ℹ Consider normalizing to gait cycle % for multi-source data")
+
+    print("\nMuscles included (from actual moment arm matrix):")
+    for i, muscle in enumerate(data_loader.muscles.index, 1):
+        print(f"  {i:2d}. {muscle}")
+
     print("\nControls:")
-    print("  - Use slider to change posture")
+    print("  - Use slider to navigate through the motion")
     print("  - Check/uncheck muscles to see their contribution")
     print("  - Click Play to animate")
     print("  - Adjust speed with dropdown")

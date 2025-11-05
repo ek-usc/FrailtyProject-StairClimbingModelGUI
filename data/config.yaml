@@ -1,13 +1,21 @@
 colors:
+  ankle_stabilizers: '#FF8C00'
   calf: '#4169E1'
   hip_extensors: '#8B0000'
   hip_flexors: '#228B22'
-  quadriceps: '#FFD700'
-  stabilizers: '#9932CC'
+  hip_stabilizers: '#9932CC'
+  knee_extensors: '#FFD700'
 frailty:
   threshold_multiplier: 1.1
+gait_cycle:
+  description: Data normalized to 0-100% gait cycle
+  note: Moment arms from actual experimental data with signs
 muscles:
   groups:
+    ankle_stabilizers:
+    - tib_ant
+    - tib_post
+    - peron_brev
     calf:
     - gastroc_med
     - gastroc_lat
@@ -19,15 +27,11 @@ muscles:
     - semimem
     hip_flexors:
     - iliacus
-    - rectus_fem
-    quadriceps:
-    - rectus_fem
-    - vast_lat
-    - vast_med
-    - vast_int
-    stabilizers:
+    hip_stabilizers:
     - glut_med
-    - tib_ant
+    - add_long
+    knee_extensors:
+    - biceps_fem_sh
 visualization:
   animation_fps: 30
   figure_height: 8
