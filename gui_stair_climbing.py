@@ -1,1410 +1,710 @@
-﻿# Updated data files:
-# (none)
-#
-# Placeholder data files:
-#   muscle_data:
-#       muscle_parameters.csv
-#       muscle_forces.csv
-#       activation_timeseries.csv
-#   moment_arms:
-#       moment_arm_matrix.csv
-#   kinematics:
-#       joint_angles.csv
-#       segment_lengths.json
-#   force_polytopes:
-#       polytopes.npz
-#   config.yaml
-#
+﻿"""
+Lower Limb Torque and Force Capacity Visualization GUI
+Frailty - Stair Climbing Analysis
+
+
+Data structure:
+(root folder)\
+    gui_stair_climbing.py
+    data\
+        momentArm_7x92x120.mat                          (moment arms for 7DOF x 92 muscles x 120 timescale)
+        force_92x120.mat                                (max muscle forces for 92 muscles x 120 timescale)
+        inverse_dynamics_scaled.sto                     (inverse dynamics for torque and force demands of the task)
+        AB09_stair_s20dg_03.txt                         (joint angles, 7DOF x 120 timescale)
+        segment_lengths.txt                             (3DOF x 1 length per relevant segment--hip, knee, ankle only)
+        3DGaitModel2392_StaticOptimization_force.sto    (for getting muscle names)
+        jointTorque_7x120.mat                           (for verification)
+
+
 # Generative AI was used to provide a workflow framework and assist with coding.
-# Prompt: "[We are] trying to model the human lower limb to study the diminishing feasible output forces and parameters as a person grows elderly, framing the problem in the context of what [we] learned in class (see the attached textbook pdf), especially about torque, force, and muscle activation spaces.
+# Tool used: Gemini 3 Pro
+# Initial prompt: "[We are] trying to model the human lower limb to study the diminishing feasible output forces and parameters as a person grows elderly, framing the problem in the context of what [we] learned in class (see the attached textbook pdf), especially about torque, force, and muscle activation spaces.
 # Also attached is a pdf compiling [our] research notes, resources, and tasks.
 # Describe thoroughly, the GUI producer's role, and outline their workflow steps:
 # "The other to write a script to visualize the output-figures to a video (for example, make a GUI, Users can choose muscles they interested in, then by dragging the progress bar, users can choose each leg posture, and corresponding feasible force set will appear next to the posture)."
 # Make sure to also describe the required input parameters that the script will accept and read, before producing the user-interactive GUI.
 # Also consider some useful, extra features for the GUI."
-
-
-"""
-Lower Limb Force Capacity Visualization GUI
-Frailty - Stair Climbing Analysis
-Uses normalized gait cycle percentage for cross-source compatibility
-UPDATED: Uses actual moment arm matrix with signed values
 """
 
 import numpy as np
-import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.patches import Polygon
-from matplotlib.animation import FuncAnimation, FFMpegWriter, PillowWriter
+from mpl_toolkits.mplot3d import Axes3D
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection, Line3DCollection
+from matplotlib.animation import FuncAnimation, PillowWriter
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
-import json
-import yaml
+from tkinter import ttk, messagebox, filedialog
+import scipy.io as sio
 from scipy.spatial import ConvexHull
-from scipy.interpolate import interp1d
+import os
 import sys
 from pathlib import Path
-import os
 
 
-class DataLoader:
-    """Load and validate all input data files"""
+# ==========================================
+# 1. DATA MANAGEMENT (Strict - Left Leg)
+# ==========================================
 
-    def __init__(self, data_path="data"):
-        self.data_path = Path(data_path)
-        self.muscles = None
-        self.kinematics = None
-        self.moment_arms = None
-        self.activations = None
-        self.forces = None
-        self.segment_lengths = None
-        self.config = None
+class DataManager:
+    """Handles data loading and processing. Crashes if files are missing."""
 
-    def check_files_exist(self):
-        """Check if all required files exist"""
-        required_files = [
-            self.data_path / "muscle_data" / "muscle_parameters.csv",
-            self.data_path / "kinematics" / "joint_angles.csv",
-            self.data_path / "kinematics" / "segment_lengths.json",
-            self.data_path / "moment_arms" / "moment_arm_matrix.csv",
-            self.data_path / "muscle_data" / "activation_timeseries.csv",
-            self.data_path / "muscle_data" / "muscle_forces.csv",
-            self.data_path / "config.yaml"
+    def __init__(self, data_dir="data"):
+        self.dir = Path(data_dir)
+        self.is_ready = False
+        self.verification_status = "Not Checked"
+
+        # Configuration: DOF Mapping for Text File Headers (SWITCHED TO LEFT)
+        self.dof_map = {
+            'tilt': 'pelvis_tilt',
+            'hip': 'hip_flexion_l',
+            'knee': 'knee_angle_l',
+            'ankle': 'ankle_angle_l'
+        }
+
+        # Updated Subset List (Left Leg Specific)
+        self.target_subset = [
+            'iliacus_l',
+            'glut_max1_l', 'glut_med1_l',
+            'add_long_l',
+            'bifemlh_l', 'bifemsh_l',
+            'semiten_l', 'semimem_l',
+            'tib_ant_l',
+            'per_brev_l',
+            'med_gas_l', 'lat_gas_l',
+            'soleus_l', 'tib_post_l'
         ]
 
-        missing_files = []
-        for file_path in required_files:
-            if not file_path.exists() or file_path.stat().st_size == 0:
-                missing_files.append(str(file_path))
+        self.muscle_names = []
+        self.R_full = None  # Moment Arms
+        self.F_so = None  # Raw Forces
+        self.F_max_all = None  # Force capacities
+        self.q_deg = None  # Kinematics
+        self.tau_demand = None  # ID
+        self.tau_verify = None
 
-        return len(missing_files) == 0, missing_files
+        self.L_thigh = 0.4
+        self.L_shank = 0.42
+        self.L_foot = 0.2
 
-    def load_all(self):
-        """Load all required data files"""
-        print("Loading data files...")
+    def load_data(self):
+        print("--- LOADING DATA (STRICT - LEFT LEG) ---")
 
-        # Load muscle parameters
-        muscle_file = self.data_path / "muscle_data" / "muscle_parameters.csv"
-        self.muscles = pd.read_csv(muscle_file, index_col='muscle_name')
-        print(f"✓ Loaded {len(self.muscles)} muscles")
+        # 1. Load Moment Arms
+        ma_path = self.dir / "momentArm_7x92x120.mat"
+        if not ma_path.exists(): raise FileNotFoundError(f"{ma_path} missing.")
+        ma_mat = sio.loadmat(str(ma_path))
+        key = [k for k in ma_mat.keys() if not k.startswith('__')][0]
+        self.R_full = ma_mat[key]  # Shape: [DOF, Muscles, Time=120]
 
-        # Load kinematics
-        joint_file = self.data_path / "kinematics" / "joint_angles.csv"
-        self.kinematics = pd.read_csv(joint_file)
+        # Define Master Time Vector based on Moment Arms (Assuming 0 to 1 normalized or similar,
+        # but here we just need index alignment 0..119)
+        n_frames_master = self.R_full.shape[2]
+        # Create a generic time vector for the master data (0 to 1)
+        time_master = np.linspace(0, 1, n_frames_master)
 
-        # Detect which column name is used (time or gait_percent)
-        if 'gait_percent' in self.kinematics.columns:
-            self.time_col = 'gait_percent'
-            self.time_units = '%'
-            print(f"✓ Loaded kinematics: {len(self.kinematics)} gait cycle points (normalized format)")
-        elif 'time' in self.kinematics.columns:
-            self.time_col = 'time'
-            self.time_units = 's'
-            print(f"✓ Loaded kinematics: {len(self.kinematics)} time points (absolute time format)")
+        # 2. Load Muscle Forces
+        f_path = self.dir / "force_92x120.mat"
+        if not f_path.exists(): raise FileNotFoundError(f"{f_path} missing.")
+        f_mat = sio.loadmat(str(f_path))
+        key_f = [k for k in f_mat.keys() if 'Force' in k][0]
+        self.F_so = f_mat[key_f]
+        if self.F_so.shape[0] != 92:
+            self.F_so = self.F_so.T
+
+        # 3. Get Muscle Names
+        sto_path = self.dir / "3DGaitModel2392_StaticOptimization_force.sto"
+        if not sto_path.exists(): raise FileNotFoundError(f"{sto_path} missing.")
+        _, self.muscle_names, _ = self._parse_sto(sto_path)
+        self.muscle_names = self.muscle_names[:92]
+
+        # 4. Estimate F_max
+        self.F_max_all = np.max(self.F_so, axis=1)
+        self.F_max_all[self.F_max_all < 100] = 100
+
+        # 5. Load Kinematics (Left Leg Headers)
+        kin_path = self.dir / "AB09_stair_s20dg_03.txt"
+        if not kin_path.exists(): raise FileNotFoundError(f"{kin_path} missing.")
+        self.q_deg = self._parse_stacked_txt(kin_path)
+
+        # 6. Load Segment Lengths
+        seg_path = self.dir / "segment_lengths.txt"
+        if seg_path.exists():
+            with open(seg_path, 'r') as f:
+                vals = [float(line.strip()) for line in f if line.strip() and (line[0].isdigit() or line[0] == '.')]
+            if len(vals) >= 3:
+                self.L_thigh, self.L_shank, self.L_foot = vals[0], vals[1], vals[2]
+
+        # 7. Load Inverse Dynamics (Left Leg Moments) WITH INTERPOLATION
+        id_path = self.dir / "inverse_dynamics_scaled.sto"
+        if not id_path.exists(): raise FileNotFoundError(f"{id_path} missing.")
+
+        # Parse returns data, column names, AND the time vector from the file
+        id_data, id_names, id_time = self._parse_sto(id_path)
+
+        # Identify Columns
+        target_cols = ['hip_flexion_l_moment', 'knee_angle_l_moment', 'ankle_angle_l_moment']
+        found_indices = []
+        for tgt in target_cols:
+            match = next((i for i, name in enumerate(id_names) if tgt == name), None)
+            if match is None:
+                match = next((i for i, name in enumerate(id_names) if tgt in name), None)
+            if match is not None:
+                found_indices.append(match)
+            else:
+                print(f"Warning: ID Column '{tgt}' not found.")
+
+        if len(found_indices) == 3:
+            # Extract raw data [N_id_frames x 3]
+            tau_raw = id_data[:, found_indices]
+
+            # Interpolation Logic matching MATLAB
+            # Check if Time needs interpolation (Length mismatch or value mismatch)
+            # Normalizing id_time to 0..1 range to match master frames
+            # (assuming both represent 0% to 100% gait cycle)
+            if len(id_time) > 1:
+                t_norm_id = (id_time - id_time[0]) / (id_time[-1] - id_time[0])
+            else:
+                t_norm_id = id_time  # Fallback
+
+            if tau_raw.shape[0] != n_frames_master:
+                print(f" Interpolating Inverse Dynamics: {tau_raw.shape[0]} frames -> {n_frames_master} frames")
+                tau_interp = np.zeros((n_frames_master, 3))
+                for i in range(3):
+                    # interp(x_new, x_old, y_old)
+                    tau_interp[:, i] = np.interp(time_master, t_norm_id, tau_raw[:, i])
+                self.tau_demand = tau_interp.T  # [3 x 120]
+            else:
+                self.tau_demand = tau_raw.T
         else:
-            raise ValueError("Kinematics file must have either 'time' or 'gait_percent' column")
+            print("Critical Warning: Could not map ID columns. Demand dot may be zero.")
+            self.tau_demand = np.zeros((3, n_frames_master))
 
-        # Load segment lengths
-        segment_file = self.data_path / "kinematics" / "segment_lengths.json"
+        # 8. Verification
+        vt_path = self.dir / "jointTorque_7x120.mat"
+        if vt_path.exists():
+            vt_mat = sio.loadmat(str(vt_path))
+            key_vt = [k for k in vt_mat.keys() if not k.startswith('__')][0]
+            self.tau_verify = vt_mat[key_vt]
+            self._verify_torque_calculation()
+        else:
+            self.verification_status = "No Ref File"
+
+        self.is_ready = True
+        print("--- DATA LOADED SUCCESSFULLY ---")
+
+    def _verify_torque_calculation(self):
+        n_dof, n_mus, n_time = self.R_full.shape
+        tau_calc = np.zeros((n_dof, n_time))
+        for t in range(n_time):
+            tau_calc[:, t] = self.R_full[:, :, t] @ self.F_so[:, t]
+
+        diff = tau_calc - self.tau_verify
+        rmse = np.sqrt(np.mean(diff ** 2))
+        self.verification_status = f"RMSE: {rmse:.4f}"
+
+    def _parse_stacked_txt(self, filepath):
+        data_dict = {}
+        current_key = None
+        current_vals = []
+
+        with open(filepath, 'r') as f:
+            lines = f.readlines()
+
+        for line in lines:
+            line = line.strip()
+            if not line: continue
+            if line[0].isalpha():
+                if current_key: data_dict[current_key] = np.array(current_vals)
+                current_key = line
+                current_vals = []
+            else:
+                try:
+                    current_vals.append(float(line))
+                except ValueError:
+                    pass
+
+        if current_key: data_dict[current_key] = np.array(current_vals)
+
         try:
-            with open(segment_file, 'r') as f:
-                content = f.read()
-                if not content:
-                    raise ValueError("Segment lengths file is empty")
-                self.segment_lengths = json.loads(content)
-            print(f"✓ Loaded segment lengths")
-        except (json.JSONDecodeError, ValueError) as e:
-            print(f"✗ Error loading segment lengths: {e}")
-            raise
+            tilt = data_dict.get(self.dof_map['tilt'], np.zeros_like(data_dict[self.dof_map['hip']]))
+            hip = data_dict[self.dof_map['hip']]
+            knee = data_dict[self.dof_map['knee']]
+            ankle = data_dict[self.dof_map['ankle']]
 
-        # Load moment arms
-        ma_file = self.data_path / "moment_arms" / "moment_arm_matrix.csv"
-        self.moment_arms = pd.read_csv(ma_file)
-        print(f"✓ Loaded moment arms")
+            min_len = min(len(tilt), len(hip), len(knee), len(ankle))
+            return np.column_stack((tilt[:min_len], hip[:min_len], knee[:min_len], ankle[:min_len]))
+        except KeyError as e:
+            raise ValueError(f"Missing required DOF header in file: {e}")
 
-        # Load activations
-        act_file = self.data_path / "muscle_data" / "activation_timeseries.csv"
-        self.activations = pd.read_csv(act_file)
-        print(f"✓ Loaded muscle activations")
+    def _parse_sto(self, filepath):
+        with open(filepath, 'r') as f:
+            lines = f.readlines()
+        header_end = 0
+        for i, line in enumerate(lines):
+            if 'endheader' in line:
+                header_end = i + 1
+                break
 
-        # Load forces
-        force_file = self.data_path / "muscle_data" / "muscle_forces.csv"
-        self.forces = pd.read_csv(force_file)
-        print(f"✓ Loaded muscle forces")
-
-        # Load config
-        config_file = self.data_path / "config.yaml"
-        with open(config_file, 'r') as f:
-            self.config = yaml.safe_load(f)
-        print(f"✓ Loaded configuration")
-
-        self.validate_data()
-
-    def validate_data(self):
-        """Validate data consistency"""
-        n_points = len(self.kinematics)
-
-        assert len(self.activations) == n_points, \
-            f"Activation data length mismatch: {len(self.activations)} vs {n_points}"
-        assert len(self.forces) == n_points, \
-            f"Force data length mismatch: {len(self.forces)} vs {n_points}"
-
-        # Check muscle names consistency
-        muscle_names = self.muscles.index.tolist()
-        act_muscles = [col for col in self.activations.columns if col != self.time_col]
-
-        missing_in_act = set(muscle_names) - set(act_muscles)
-        if missing_in_act:
-            print(f"Warning: Muscles in parameters but not in activations: {missing_in_act}")
-
-        print("✓ Data validation passed")
-
-
-class LegModel:
-    """Forward kinematics and visualization for 2D leg model"""
-
-    def __init__(self, segment_lengths):
-        self.thigh_length = segment_lengths['thigh_length']
-        self.shank_length = segment_lengths['shank_length']
-        self.foot_length = segment_lengths['foot_length']
-
-    def compute_positions(self, hip_angle, knee_angle, ankle_angle):
-        """
-        Compute joint positions given angles (in degrees)
-        Returns: hip, knee, ankle, toe positions as (x, y) tuples
-        Origin at hip joint
-        """
-        # Convert to radians
-        hip_rad = np.radians(hip_angle)
-        knee_rad = np.radians(knee_angle)
-        ankle_rad = np.radians(ankle_angle)
-
-        # Hip position (origin)
-        hip = np.array([0.0, 0.0])
-
-        # Knee position
-        knee_x = self.thigh_length * np.sin(hip_rad)
-        knee_y = -self.thigh_length * np.cos(hip_rad)
-        knee = np.array([knee_x, knee_y])
-
-        # Ankle position
-        shank_angle = hip_rad - knee_rad
-        ankle_x = knee_x + self.shank_length * np.sin(shank_angle)
-        ankle_y = knee_y - self.shank_length * np.cos(shank_angle)
-        ankle = np.array([ankle_x, ankle_y])
-
-        # Toe position
-        # Ankle angle is relative to shank
-        foot_angle = shank_angle + ankle_rad
-        toe_x = ankle_x + self.foot_length * np.cos(foot_angle)
-        toe_y = ankle_y + self.foot_length * np.sin(foot_angle)
-        toe = np.array([toe_x, toe_y])
-
-        return hip, knee, ankle, toe
-
-
-class PolytopeComputer:
-    """Compute feasible force polytopes"""
-
-    def __init__(self, muscle_params, segment_lengths):
-        self.muscle_params = muscle_params
-        self.body_weight = segment_lengths['subject_mass'] * 9.81
-        # Store segment lengths
-        self.segment_lengths = segment_lengths
-
-    def compute_jacobian(self, hip_angle, knee_angle, ankle_angle,
-                         thigh_length, shank_length):
-        """
-        Compute Jacobian matrix J: maps joint velocities to endpoint velocities
-        [v_x, v_y]^T = J * [θ̇_hip, θ̇_knee, θ̇_ankle]^T
-
-        For force analysis: F_endpoint = J^-T * τ_joint
-
-        Angle conventions:
-        - hip_angle: from vertical, positive = forward (CCW)
-        - knee_angle: flexion angle (relative to thigh), positive = bending
-        - ankle_angle: relative to shank
-        """
-        # Convert to radians
-        theta1 = np.radians(hip_angle)
-        theta2 = np.radians(knee_angle)
-        theta3 = np.radians(ankle_angle)
-
-        l1 = thigh_length
-        l2 = shank_length
-        l3 = self.segment_lengths['foot_length']  # Access from stored dict
-
-        # Shank angle (absolute from vertical)
-        theta_shank = theta1 - theta2
-
-        # Foot angle (absolute from vertical)
-        theta_foot = theta_shank + theta3
-
-        # Jacobian for toe position (2D endpoint)
-        # Rows are [x, y], columns are [hip, knee, ankle]
-        J = np.array([
-            # ∂x/∂θ_hip, ∂x/∂θ_knee, ∂x/∂θ_ankle
-            [l1 * np.cos(theta1) + l2 * np.cos(theta_shank) + l3 * np.cos(theta_foot),
-             -l2 * np.cos(theta_shank) - l3 * np.cos(theta_foot),
-             -l3 * np.cos(theta_foot)],
-
-            # ∂y/∂θ_hip, ∂y/∂θ_knee, ∂y/∂θ_ankle
-            [l1 * np.sin(theta1) + l2 * np.sin(theta_shank) + l3 * np.sin(theta_foot),
-             l2 * np.sin(theta_shank) + l3 * np.sin(theta_foot),
-             l3 * np.sin(theta_foot)]
-        ])
-
-        return J
-
-    def compute_polytope(self, moment_arms, muscle_forces, jacobian,
-                        selected_muscles):
-        """
-        Compute force polytope vertices
-
-        Args:
-            moment_arms: dict with {muscle_name: [hip_ma, knee_ma, ankle_ma]}
-            muscle_forces: dict with {muscle_name: max_force}
-            jacobian: 2x3 or 3x3 matrix
-            selected_muscles: list of muscle names to include
-
-        Returns:
-            vertices: Nx2 array of (Fx, Fy) points defining polytope boundary
-        """
-        # Build moment arm matrix R (3 joints x N muscles)
-        R = []
-        F_max = []
-
-        for muscle in selected_muscles:
-            if muscle in moment_arms and muscle in muscle_forces:
-                R.append(moment_arms[muscle])
-                F_max.append(muscle_forces[muscle])
-
-        if len(R) == 0:
-            return np.array([[0, 0]])
-
-        R = np.array(R).T  # Shape: (3, n_muscles)
-        F_max = np.array(F_max)
-
-        # Sample muscle activation space
-        n_muscles = len(selected_muscles)
-
-        if n_muscles <= 10:
-            # For small number of muscles, use all vertices
-            from itertools import product
-            activations = np.array(list(product([0, 1], repeat=n_muscles)))
+        if header_end < len(lines):
+            col_names = lines[header_end].strip().split()
+            data = np.loadtxt(lines[header_end + 1:])
+            # Return Data, Names, and Time Vector (col 0)
+            return data[:, 1:], col_names[1:], data[:, 0]
         else:
-            # For many muscles, sample randomly
-            n_samples = min(2**n_muscles, 1000)
-            activations = np.random.rand(n_samples, n_muscles)
-            # Add corner points
-            corners = np.eye(n_muscles)
-            activations = np.vstack([activations, corners, np.zeros((1, n_muscles))])
+            return np.array([]), [], []
 
-        # Compute endpoint forces for each activation pattern
-        endpoint_forces = []
+    def get_muscle_indices(self, use_subset=False):
+        """Filters for LEFT side muscles (_l)"""
+        indices = []
+        for i, name in enumerate(self.muscle_names):
+            name_lower = name.lower()
 
-        for a in activations:
-            # Muscle forces
-            F_muscle = a * F_max
-
-            # Joint torques: tau = R * F_muscle
-            tau = R @ F_muscle
-
-            # Endpoint force: F = J^-T * tau
-            try:
-                if jacobian.shape[0] == 2:
-                    # Use only hip and knee torques for 2D force
-                    J_inv_T = np.linalg.pinv(jacobian[:, :2]).T
-                    F_endpoint = J_inv_T @ tau[:2]
-                else:
-                    J_inv_T = np.linalg.pinv(jacobian).T
-                    F_endpoint = J_inv_T @ tau
-                    F_endpoint = F_endpoint[:2]  # Take only Fx, Fy
-
-                endpoint_forces.append(F_endpoint)
-            except:
+            # Global Filter: Must be LEFT side (_l)
+            if not name_lower.endswith('_l'):
                 continue
 
-        if len(endpoint_forces) == 0:
-            return np.array([[0, 0]])
+            if use_subset:
+                is_target = False
+                for target in self.target_subset:
+                    # Specific matching for the user provided list
+                    if name_lower.startswith(target.lower()):
+                        is_target = True
+                        break
+                if not is_target: continue
 
-        endpoint_forces = np.array(endpoint_forces)
+            indices.append(i)
+        return sorted(indices)
 
-        # Compute convex hull
+
+# ==========================================
+# 2. MATH ENGINE (Left Leg Focus)
+# ==========================================
+
+class Engine:
+    def __init__(self, data_obj):
+        self.d = data_obj
+        self.n_samples = 2000
+        self.alphas_base = np.random.rand(self.n_samples, 92)
+
+    def get_kinematic_chain(self, frame):
+        q = self.d.q_deg[frame]  # [Tilt, Hip, Knee, Ankle]
+
+        t_pelvis = np.radians(q[0])
+        t_thigh = t_pelvis + np.radians(q[1])
+        t_shank = t_thigh + np.radians(q[2])
+        t_foot = t_shank + np.radians(q[3]) + np.pi / 2
+
+        l1, l2, l3 = self.d.L_thigh, self.d.L_shank, self.d.L_foot
+
+        def polar_to_cart(L, theta):
+            return np.array([L * np.sin(theta), -L * np.cos(theta)])
+
+        p_hip = np.array([0.0, 0.0])
+        p_knee = p_hip + polar_to_cart(l1, t_thigh)
+        p_ankle = p_knee + polar_to_cart(l2, t_shank)
+        p_toe = p_ankle + polar_to_cart(l3, t_foot)
+
+        return {
+            'p_hip': p_hip, 'p_knee': p_knee, 'p_ankle': p_ankle, 'p_toe': p_toe,
+            't_thigh': t_thigh, 't_shank': t_shank, 't_foot': t_foot
+        }
+
+    def get_force_jacobian(self, frame):
+        kin = self.get_kinematic_chain(frame)
+        p_toe = kin['p_toe']
+        p_hip = kin['p_hip']
+        p_knee = kin['p_knee']
+        p_ankle = kin['p_ankle']
+
+        r_hip = p_toe - p_hip
+        r_knee = p_toe - p_knee
+        r_ankle = p_toe - p_ankle
+
+        j1 = np.array([-r_hip[1], r_hip[0]])
+        j2 = np.array([-r_knee[1], r_knee[0]])
+        j3 = np.array([-r_ankle[1], r_ankle[0]])
+
+        J = np.column_stack([j1, j2, j3])
+        return J
+
+    def compute_polytope(self, frame, active_indices, mode='torque'):
+        if not active_indices:
+            return np.zeros((1, 3))
+
+            # INDICES UPDATE for Left Leg
+        # Standard OpenSim Order assumed: 0:Tilt, 1-3:Right, 4-6:Left
+        # So HipL=4, KneeL=5, AnkleL=6
+        R_slice = self.d.R_full[4:7, active_indices, frame]
+        F_slice = self.d.F_max_all[active_indices]
+        generators = R_slice * F_slice
+
+        if mode == 'force':
+            J = self.get_force_jacobian(frame)
+            try:
+                J_T_pinv = np.linalg.pinv(J.T)
+                generators = J_T_pinv @ generators
+            except np.linalg.LinAlgError:
+                return np.zeros((3, 2))
+
+        n_gen = len(active_indices)
+        alphas = self.alphas_base[:, :n_gen]
+        points = alphas @ generators.T
+
+        total_sum = np.sum(generators, axis=1)
+        points = np.vstack([points, np.zeros_like(total_sum), total_sum])
+
         try:
-            hull = ConvexHull(endpoint_forces)
-            vertices = endpoint_forces[hull.vertices]
-        except:
-            vertices = endpoint_forces
-
-        return vertices
-
-
-class StairClimbingGUI:
-    """Main GUI application"""
-
-    def __init__(self, root, data_loader):
-        self.root = root
-
-        # Store time column info from data loader
-        self.time_col = data_loader.time_col
-        self.time_units = data_loader.time_units
-
-        # Set appropriate title based on format
-        if self.time_col == 'gait_percent':
-            title = "Lower Limb Force Capacity - Stair Climbing Analysis (Normalized Gait Cycle)"
-        else:
-            title = "Lower Limb Force Capacity - Stair Climbing Analysis"
-        self.root.title(title)
-
-        self.data = data_loader
-        self.leg_model = LegModel(data_loader.segment_lengths)
-        self.polytope_computer = PolytopeComputer(
-            data_loader.muscles,
-            data_loader.segment_lengths
-        )
-
-        # State variables
-        self.current_frame = 0
-        self.n_frames = len(data_loader.kinematics)
-        self.is_playing = False
-        self.is_exporting = False
-        self.animation = None
-
-        # Selected muscles (default: all)
-        self.muscle_names = data_loader.muscles.index.tolist()
-        self.muscle_vars = {}  # Will hold tk.BooleanVar for each muscle
-
-        # Default view limits (zoomed out 0.5x = 2x range, panned down 500 N)
-        self.default_leg_xlim = [-0.6, 0.6]
-        self.default_leg_ylim = [-1.2, 0.2]
-        self.default_polytope_xlim = [-500, 300]
-        self.default_polytope_ylim = [-500, 1500]
-
-        # Current view limits (will be updated by user pan/zoom)
-        self.current_leg_xlim = self.default_leg_xlim.copy()
-        self.current_leg_ylim = self.default_leg_ylim.copy()
-        self.current_polytope_xlim = self.default_polytope_xlim.copy()
-        self.current_polytope_ylim = self.default_polytope_ylim.copy()
-
-        # Pre-compute moment arms interpolation
-        self.setup_moment_arms()
-
-        # Create GUI layout
-        self.create_gui()
-
-        # Initial draw
-        self.update_visualization()
-
-    def setup_moment_arms(self):
-        """Pre-process moment arms for fast lookup"""
-        self.moment_arm_dict = {}
-
-        for muscle in self.muscle_names:
-            muscle_data = self.data.moment_arms[
-                self.data.moment_arms['muscle'] == muscle
-            ]
-
-            if len(muscle_data) > 0:
-                time_vals = muscle_data[self.time_col].values
-                hip_ma = muscle_data['hip_moment_arm'].values
-                knee_ma = muscle_data['knee_moment_arm'].values
-                ankle_ma = muscle_data['ankle_moment_arm'].values
-
-                # Create interpolation functions
-                if len(time_vals) > 1:
-                    self.moment_arm_dict[muscle] = {
-                        'hip': interp1d(time_vals, hip_ma, fill_value='extrapolate'),
-                        'knee': interp1d(time_vals, knee_ma, fill_value='extrapolate'),
-                        'ankle': interp1d(time_vals, ankle_ma, fill_value='extrapolate'),
-                    }
-                else:
-                    # Single point - use constant value
-                    self.moment_arm_dict[muscle] = {
-                        'hip': lambda t, val=hip_ma[0]: val,
-                        'knee': lambda t, val=knee_ma[0]: val,
-                        'ankle': lambda t, val=ankle_ma[0]: val,
-                    }
-
-    def get_moment_arms(self, frame_idx):
-        """Get moment arms at specific frame index"""
-        time_val = self.data.kinematics.iloc[frame_idx][self.time_col]
-        ma_dict = {}
-
-        for muscle in self.muscle_names:
-            if muscle in self.moment_arm_dict:
-                try:
-                    ma_dict[muscle] = [
-                        float(self.moment_arm_dict[muscle]['hip'](time_val)),
-                        float(self.moment_arm_dict[muscle]['knee'](time_val)),
-                        float(self.moment_arm_dict[muscle]['ankle'](time_val))
-                    ]
-                except:
-                    ma_dict[muscle] = [0.0, 0.0, 0.0]
+            hull = ConvexHull(points)
+            if mode == 'force':
+                return points[hull.vertices]
             else:
-                ma_dict[muscle] = [0.0, 0.0, 0.0]
+                return points, hull
+        except:
+            return points, None
 
-        return ma_dict
 
-    def create_gui(self):
-        """Create main GUI layout"""
+# ==========================================
+# 3. GUI APPLICATION
+# ==========================================
 
-        # Main container
-        main_frame = ttk.Frame(self.root)
-        main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+class NeuromechApp:
+    def __init__(self, root, data_obj):
+        self.root = root
+        self.root.title("Feasible Torque/Force Sets Neuromechanics GUI")
+        self.root.geometry("1400x900")
 
-        # Left panel: Controls
-        control_frame = ttk.Frame(main_frame, width=280)
-        control_frame.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 10))
-        control_frame.pack_propagate(False)
+        self.d = data_obj
+        self.eng = Engine(data_obj)
 
-        # Right panel: Visualization
-        viz_frame = ttk.Frame(main_frame)
-        viz_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        # State
+        self.frame = 0
+        self.is_playing = False
+        self.plot_mode = "torque"
+        self.use_subset = True
+        self.speed_var = tk.DoubleVar(value=1.0)
+        self.chk_vars = {}
 
-        # === CONTROL PANEL ===
+        self.artists = {'leg': {}, 'poly': {}, 'demand': {}}
+        self.ax_poly_ref = None
+        self.toolbar = None  # Reference to toolbar
+        self.gs = None  # Reference to GridSpec
 
-        # Title
-        title_label = ttk.Label(control_frame, text="Control Panel",
-                               font=('Arial', 12, 'bold'))
-        title_label.pack(pady=(0, 10))
+        self._setup_ui()
+        self._init_plots()
+        self.refresh_muscle_list()
+        self.update_frame(0)
 
-        # Muscle selection
-        muscle_frame = ttk.LabelFrame(control_frame, text="Muscle Selection",
-                                      padding=10)
-        muscle_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+    def _setup_ui(self):
+        main_pane = tk.PanedWindow(self.root, orient=tk.HORIZONTAL)
+        main_pane.pack(fill=tk.BOTH, expand=True)
 
-        # Scrollable muscle list
-        canvas = tk.Canvas(muscle_frame, height=200)
-        scrollbar = ttk.Scrollbar(muscle_frame, orient="vertical",
-                                  command=canvas.yview)
-        scrollable_frame = ttk.Frame(canvas)
+        left_panel = ttk.Frame(main_pane, width=350, padding=10)
+        right_panel = ttk.Frame(main_pane, padding=10)
+        main_pane.add(left_panel)
+        main_pane.add(right_panel)
 
-        scrollable_frame.bind(
-            "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-        )
+        gb_info = ttk.LabelFrame(left_panel, text="Model Status")
+        gb_info.pack(fill="x", pady=5)
+        ttk.Label(gb_info, text=self.d.verification_status).pack(anchor="w")
 
-        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        gb_set = ttk.LabelFrame(left_panel, text="Visualization")
+        gb_set.pack(fill="x", pady=5)
+
+        self.var_mode = tk.StringVar(value="torque")
+        ttk.Radiobutton(gb_set, text="Torque Space (3D: Hip/Knee/Ankle)",
+                        variable=self.var_mode, value="torque",
+                        command=self.on_mode_change).pack(anchor="w")
+        ttk.Radiobutton(gb_set, text="Force Space (2D: Fx/Fy)",
+                        variable=self.var_mode, value="force",
+                        command=self.on_mode_change).pack(anchor="w")
+
+        self.var_subset = tk.BooleanVar(value=True)
+        ttk.Checkbutton(gb_set, text="Limit to 14 Muscles",
+                        variable=self.var_subset,
+                        command=self.refresh_muscle_list).pack(anchor="w", pady=5)
+
+        ttk.Button(gb_set, text="Select All", command=self.select_all).pack(side="left", padx=2)
+        ttk.Button(gb_set, text="Select None", command=self.select_none).pack(side="left", padx=2)
+
+        # UPDATE LABEL
+        lbl = ttk.Label(left_panel, text="Active Muscles (Left Only)", font=("Bold", 10))
+        lbl.pack(anchor="w", pady=(10, 0))
+
+        list_container = ttk.Frame(left_panel)
+        list_container.pack(fill="both", expand=True)
+
+        canvas = tk.Canvas(list_container, bg="#f0f0f0")
+        scrollbar = ttk.Scrollbar(list_container, orient="vertical", command=canvas.yview)
+        self.scroll_frame = ttk.Frame(canvas)
+        self.scroll_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=self.scroll_frame, anchor="nw")
         canvas.configure(yscrollcommand=scrollbar.set)
-
-        # Create checkboxes for each muscle in 2 columns
-        muscle_groups = self.data.config['muscles']['groups']
-
-        row = 0
-        for group_name, muscles in muscle_groups.items():
-            # Group label spanning both columns
-            group_label = ttk.Label(scrollable_frame, text=f"▼ {group_name}",
-                                   font=('Arial', 9, 'bold'))
-            group_label.grid(row=row, column=0, columnspan=2, sticky='w', pady=(5, 2))
-            row += 1
-
-            # Create checkboxes in 2 columns
-            col = 0
-            for idx, muscle in enumerate(muscles):
-                if muscle in self.muscle_names:
-                    var = tk.BooleanVar(value=True)
-                    self.muscle_vars[muscle] = var
-
-                    cb = ttk.Checkbutton(
-                        scrollable_frame,
-                        text=muscle.replace('_', ' ').title(),
-                        variable=var,
-                        command=self.update_visualization
-                    )
-                    cb.grid(row=row, column=col, sticky='w', padx=(15 if col == 0 else 5, 5))
-
-                    col += 1
-                    if col >= 2:
-                        col = 0
-                        row += 1
-
-            # Move to next row if we ended on column 1
-            if col == 1:
-                row += 1
 
         canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
 
-        # Select/Deselect buttons
-        btn_frame = ttk.Frame(muscle_frame)
-        btn_frame.pack(fill=tk.X, pady=(5, 0))
+        self.fig = plt.Figure(figsize=(10, 6), dpi=100)
 
-        ttk.Button(btn_frame, text="All",
-                  command=self.select_all_muscles).pack(side=tk.LEFT,
-                                                        padx=(0, 5))
-        ttk.Button(btn_frame, text="None",
-                  command=self.deselect_all_muscles).pack(side=tk.LEFT)
+        # Use GridSpec to make Posture plot smaller (Ratio 1 : 1.8)
+        self.gs = self.fig.add_gridspec(1, 2, width_ratios=[1, 1.8])
+        self.ax_stick = self.fig.add_subplot(self.gs[0])
 
-        # Time/Gait cycle slider
-        slider_label = "Gait Cycle Position" if self.time_col == 'gait_percent' else "Time Position"
-        slider_frame = ttk.LabelFrame(control_frame, text=slider_label, padding=10)
-        slider_frame.pack(fill=tk.X, pady=(0, 10))
+        self.canvas = FigureCanvasTkAgg(self.fig, right_panel)
+        self.canvas.get_tk_widget().pack(fill="both", expand=True)
 
-        self.time_label = ttk.Label(slider_frame, text=f"Position: 0.0{self.time_units}")
-        self.time_label.pack()
+        # Frame for Toolbar to allow recreation
+        self.toolbar_frame = ttk.Frame(right_panel)
+        self.toolbar_frame.pack(fill="x", pady=2)
 
-        self.phase_label = ttk.Label(slider_frame, text="Phase: Heel Strike",
-                                     font=('Arial', 9, 'italic'))
-        self.phase_label.pack()
+        # Controls Frame
+        ctrl_frame = ttk.Frame(right_panel)
+        ctrl_frame.pack(fill="x", pady=5)
 
-        self.slider = ttk.Scale(slider_frame, from_=0, to=self.n_frames-1,
-                               orient=tk.HORIZONTAL, command=self.on_slider_change)
-        self.slider.pack(fill=tk.X, pady=(5, 0))
+        self.btn_play = ttk.Button(ctrl_frame, text="▶ Play", command=self.toggle_play)
+        self.btn_play.pack(side="left")
 
-        # Playback controls
-        playback_frame = ttk.LabelFrame(control_frame, text="Playback",
-                                        padding=10)
-        playback_frame.pack(fill=tk.X, pady=(0, 10))
+        ttk.Label(ctrl_frame, text="Speed:").pack(side="left", padx=(15, 5))
+        self.lbl_speed = ttk.Label(ctrl_frame, text="1.0x", width=4)
+        self.lbl_speed.pack(side="left")
+        scale_speed = ttk.Scale(ctrl_frame, from_=0.1, to=2.0, variable=self.speed_var,
+                                command=lambda v: self.lbl_speed.config(text=f"{float(v):.1f}x"))
+        scale_speed.pack(side="left", padx=5)
 
-        btn_container = ttk.Frame(playback_frame)
-        btn_container.pack()
+        self.slider = ttk.Scale(ctrl_frame, from_=0, to=119, command=self.on_slider)
+        self.slider.pack(side="left", fill="x", expand=True, padx=10)
+        self.lbl_frame = ttk.Label(ctrl_frame, text="0", width=5)
+        self.lbl_frame.pack(side="left")
 
-        self.play_btn = ttk.Button(btn_container, text="▶ Play",
-                                   command=self.toggle_play, width=8)
-        self.play_btn.grid(row=0, column=0, padx=2)
+        ttk.Button(ctrl_frame, text="Export GIF", command=self.export_gif).pack(side="right")
 
-        ttk.Button(btn_container, text="⏹ Stop",
-                  command=self.stop_animation, width=8).grid(row=0, column=1,
-                                                             padx=2)
+    def _create_toolbar(self):
+        """Recreates the toolbar to ensure it tracks correct axes"""
+        if self.toolbar:
+            self.toolbar.destroy()
 
-        # Speed control
-        speed_frame = ttk.Frame(playback_frame)
-        speed_frame.pack(pady=(5, 0))
-
-        ttk.Label(speed_frame, text="Speed:").pack(side=tk.LEFT)
-        self.speed_var = tk.StringVar(value="1x")
-        speed_combo = ttk.Combobox(speed_frame, textvariable=self.speed_var,
-                                   values=["0.25x", "0.5x", "1x", "2x", "4x"],
-                                   width=8, state='readonly')
-        speed_combo.pack(side=tk.LEFT, padx=(5, 0))
-        speed_combo.set("1x")
-
-        # Export controls
-        export_frame = ttk.LabelFrame(control_frame, text="Export", padding=10)
-        export_frame.pack(fill=tk.X, pady=(0, 10))
-
-        self.export_btn = ttk.Button(export_frame, text="📹 Export Video",
-                                     command=self.export_video)
-        self.export_btn.pack(fill=tk.X)
-
-        self.export_status = ttk.Label(export_frame, text="",
-                                       font=('Arial', 8, 'italic'))
-        self.export_status.pack(pady=(5, 0))
-
-        # Info display
-        info_frame = ttk.LabelFrame(control_frame, text="Current State",
-                                    padding=10)
-        info_frame.pack(fill=tk.BOTH, expand=True)
-
-        self.info_text = tk.Text(info_frame, height=6, width=30,
-                                font=('Courier', 8))
-        self.info_text.pack(fill=tk.BOTH, expand=True)
-
-        # === VISUALIZATION PANEL ===
-
-        # Create matplotlib figure
-        self.fig = plt.figure(figsize=(12, 7))
-
-        # Left subplot: Leg skeleton
-        self.ax_leg = self.fig.add_subplot(121)
-        self.ax_leg.set_aspect('equal')
-        self.ax_leg.set_xlim(self.default_leg_xlim)
-        self.ax_leg.set_ylim(self.default_leg_ylim)
-        self.ax_leg.set_xlabel('X (m)')
-        self.ax_leg.set_ylabel('Y (m)')
-        self.ax_leg.set_title('Leg Posture (Sagittal Plane)')
-        self.ax_leg.grid(True, alpha=0.3)
-
-        # Right subplot: Force polytope
-        self.ax_polytope = self.fig.add_subplot(122)
-        self.ax_polytope.set_aspect('equal')
-        self.ax_polytope.set_xlim(self.default_polytope_xlim)
-        self.ax_polytope.set_ylim(self.default_polytope_ylim)
-        self.ax_polytope.set_xlabel('Horizontal Force Fx (N)')
-        self.ax_polytope.set_ylabel('Vertical Force Fy (N)')
-        self.ax_polytope.set_title('Feasible Force Polytope')
-        self.ax_polytope.grid(True, alpha=0.3)
-        self.ax_polytope.axhline(y=0, color='k', linewidth=0.5)
-        self.ax_polytope.axvline(x=0, color='k', linewidth=0.5)
-
-        plt.tight_layout()
-
-        # Embed in tkinter
-        self.canvas = FigureCanvasTkAgg(self.fig, master=viz_frame)
-        self.canvas.draw()
-        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-
-        # Add navigation toolbar for pan/zoom
-        toolbar_frame = ttk.Frame(viz_frame)
-        toolbar_frame.pack(side=tk.BOTTOM, fill=tk.X)
-        self.toolbar = NavigationToolbar2Tk(self.canvas, toolbar_frame)
+        # Create new toolbar in the container frame
+        self.toolbar = NavigationToolbar2Tk(self.canvas, self.toolbar_frame)
         self.toolbar.update()
 
-    def select_all_muscles(self):
-        """Select all muscles"""
-        for var in self.muscle_vars.values():
-            var.set(True)
-        self.update_visualization()
+    def _init_plots(self):
+        self.ax_stick.set_xlim(-0.5, 1.0)
+        self.ax_stick.set_ylim(-1.2, 0.5)
+        self.ax_stick.set_aspect('equal')
+        self.ax_stick.grid(True)
+        self.ax_stick.set_title("Kinematics (Left Leg) (m)")
 
-    def deselect_all_muscles(self):
-        """Deselect all muscles"""
-        for var in self.muscle_vars.values():
-            var.set(False)
-        self.update_visualization()
+        self.artists['leg']['thigh'], = self.ax_stick.plot([], [], 'o-', lw=5, color='#333333', label='Thigh')
+        self.artists['leg']['shank'], = self.ax_stick.plot([], [], 'o-', lw=5, color='#0066cc', label='Shank')
+        self.artists['leg']['foot'], = self.ax_stick.plot([], [], 'o-', lw=5, color='#009933', label='Foot')
+        self.artists['leg']['ground'] = self.ax_stick.axhline(-1.0, color='gray', lw=2)
 
-    def on_slider_change(self, value):
-        """Handle slider movement"""
-        self.current_frame = int(float(value))
-        self.update_visualization()
+        self._reset_poly_axes()
 
-    def toggle_play(self):
-        """Toggle play/pause"""
-        if self.is_playing:
-            self.pause_animation()
+    def _reset_poly_axes(self):
+        if self.ax_poly_ref:
+            self.fig.delaxes(self.ax_poly_ref)
+
+        mode = self.var_mode.get()
+
+        if mode == 'torque':
+            self.ax_poly_ref = self.fig.add_subplot(self.gs[1], projection='3d')
+            self.ax_poly_ref.set_xlabel("Hip (Nm)")
+            self.ax_poly_ref.set_ylabel("Knee (Nm)")
+            self.ax_poly_ref.set_zlabel("Ankle (Nm)")
+            self.ax_poly_ref.set_title("Feasible Torque Set (3D)")
+            lim = 300
+            self.ax_poly_ref.set_xlim(-lim, lim)
+            self.ax_poly_ref.set_ylim(-lim, lim)
+            self.ax_poly_ref.set_zlim(-lim, lim)
+
+            self.artists['poly']['verts_3d'] = self.ax_poly_ref.scatter([], [], [], c='blue', s=10, depthshade=False)
+            self.artists['demand']['ray_3d'], = self.ax_poly_ref.plot([], [], [], 'r--', lw=1.5, label='Demand')
+            self.artists['demand']['dot_3d'], = self.ax_poly_ref.plot([], [], [], 'ro', ms=6)
+            self.artists['poly']['edges_3d'] = None
+
         else:
-            self.play_animation()
-
-    def play_animation(self):
-        """Start animation"""
-        self.is_playing = True
-        self.play_btn.config(text="⏸ Pause")
-
-        speed = float(self.speed_var.get().replace('x', ''))
-        interval = int(1000 / (30 * speed))  # 30 fps base
-
-        def update_frame():
-            if self.is_playing:
-                self.current_frame = (self.current_frame + 1) % self.n_frames
-                self.slider.set(self.current_frame)
-                self.update_visualization()
-                self.root.after(interval, update_frame)
-
-        update_frame()
-
-    def pause_animation(self):
-        """Pause animation"""
-        self.is_playing = False
-        self.play_btn.config(text="▶ Play")
-
-    def stop_animation(self):
-        """Stop animation and reset"""
-        self.pause_animation()
-        self.current_frame = 0
-        self.slider.set(0)
-        self.update_visualization()
-
-    def export_video(self):
-        """Export animation as video file"""
-        if self.is_exporting:
-            return
-
-        # Ask user for save location
-        filename = filedialog.asksaveasfilename(
-            defaultextension=".mp4",
-            filetypes=[
-                ("MP4 Video", "*.mp4"),
-                ("GIF Animation", "*.gif"),
-                ("All Files", "*.*")
-            ],
-            initialfile="stair_climbing_animation.mp4"
-        )
-
-        if not filename:
-            return  # User cancelled
-
-        # Disable controls during export
-        self.is_exporting = True
-        self.export_btn.config(state='disabled')
-        self.export_status.config(text="Exporting... Please wait")
-        self.root.update()
-
-        try:
-            # Determine file format
-            file_ext = Path(filename).suffix.lower()
-
-            # Get selected muscles (save state)
-            selected_muscles = [m for m, var in self.muscle_vars.items()
-                              if var.get()]
-
-            # Create a new figure for export (to avoid disrupting GUI)
-            export_fig = plt.figure(figsize=(12, 7))
-            ax_leg_export = export_fig.add_subplot(121)
-            ax_polytope_export = export_fig.add_subplot(122)
-
-            # Animation function
-            def animate(frame):
-                # Update status
-                progress = int(100 * frame / self.n_frames)
-                self.export_status.config(text=f"Exporting... {progress}%")
-                self.root.update()
-
-                # Clear axes
-                ax_leg_export.clear()
-                ax_polytope_export.clear()
-
-                # Get frame data
-                row = self.data.kinematics.iloc[frame]
-                time_val = row[self.time_col]
-                hip_angle = row['hip_angle']
-                knee_angle = row['knee_angle']
-                ankle_angle = row['ankle_angle']
-                phase = row['phase']
-
-                # === LEG PLOT ===
-                ax_leg_export.set_aspect('equal')
-                ax_leg_export.set_xlim(self.current_leg_xlim)
-                ax_leg_export.set_ylim(self.current_leg_ylim)
-                ax_leg_export.set_xlabel('X (m)')
-                ax_leg_export.set_ylabel('Y (m)')
-                ax_leg_export.set_title('Leg Posture (Sagittal Plane)')
-                ax_leg_export.grid(True, alpha=0.3)
-
-                # Compute joint positions
-                hip, knee, ankle, toe = self.leg_model.compute_positions(
-                    hip_angle, knee_angle, ankle_angle
-                )
-
-                # Draw ground
-                ax_leg_export.plot([-0.8, 0.8], [-1.0, -1.0], 'k-', linewidth=2)
-                ax_leg_export.fill_between([-0.8, 0.8], [-1.0, -1.0], [-1.3, -1.3],
-                                          color='gray', alpha=0.3)
-
-                # Draw skeleton
-                ax_leg_export.plot([hip[0], knee[0]], [hip[1], knee[1]],
-                                  'o-', color='#2E4057', linewidth=4, markersize=8)
-                ax_leg_export.plot([knee[0], ankle[0]], [knee[1], ankle[1]],
-                                  'o-', color='#048A81', linewidth=4, markersize=8)
-                ax_leg_export.plot([ankle[0], toe[0]], [ankle[1], toe[1]],
-                                  'o-', color='#54C6EB', linewidth=4, markersize=8)
-
-                # Draw muscles
-                activations = self.data.activations.iloc[frame]
-                for muscle in selected_muscles:
-                    if muscle in activations:
-                        activation = activations[muscle]
-
-                        if 'glut' in muscle or 'iliacus' in muscle or 'add' in muscle:
-                            start = hip + np.array([-0.05, 0.05])
-                            end = (hip + knee) / 2
-                        elif 'biceps' in muscle or 'semi' in muscle:
-                            start = (hip + knee) / 2
-                            end = knee
-                        elif 'gastroc' in muscle or 'soleus' in muscle:
-                            start = knee
-                            end = ankle
-                        elif 'tib' in muscle or 'peron' in muscle:
-                            start = knee
-                            end = ankle
-                        else:
-                            continue
-
-                        alpha = 0.3 + 0.7 * activation
-                        linewidth = 1 + 3 * activation
-                        ax_leg_export.plot([start[0], end[0]], [start[1], end[1]],
-                                          color='red', alpha=alpha, linewidth=linewidth)
-
-                # Labels
-                ax_leg_export.text(hip[0]-0.1, hip[1]+0.05, 'Hip', fontsize=9)
-                ax_leg_export.text(knee[0]-0.1, knee[1]+0.05, 'Knee', fontsize=9)
-                ax_leg_export.text(ankle[0]-0.1, ankle[1]+0.05, 'Ankle', fontsize=9)
-
-                # Add time/gait cycle annotation
-                if self.time_col == 'gait_percent':
-                    time_text = f"Gait Cycle: {time_val:.1f}%\nPhase: {phase}"
-                else:
-                    time_text = f"Time: {time_val:.3f} s\nPhase: {phase}"
-
-                ax_leg_export.text(0.02, 0.98, time_text,
-                                  transform=ax_leg_export.transAxes,
-                                  verticalalignment='top',
-                                  bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
-
-                # === POLYTOPE PLOT ===
-                ax_polytope_export.set_aspect('equal')
-                ax_polytope_export.set_xlim(self.current_polytope_xlim)
-                ax_polytope_export.set_ylim(self.current_polytope_ylim)
-                ax_polytope_export.set_xlabel('Horizontal Force Fx (N)')
-                ax_polytope_export.set_ylabel('Vertical Force Fy (N)')
-                ax_polytope_export.set_title('Feasible Force Polytope')
-                ax_polytope_export.grid(True, alpha=0.3)
-                ax_polytope_export.axhline(y=0, color='k', linewidth=0.5)
-                ax_polytope_export.axvline(x=0, color='k', linewidth=0.5)
-
-                if len(selected_muscles) > 0:
-                    # Get moment arms
-                    moment_arms = self.get_moment_arms(frame)
-
-                    # Get max forces
-                    muscle_forces = {}
-                    for muscle in selected_muscles:
-                        muscle_forces[muscle] = self.data.muscles.loc[muscle, 'F0_max']
-
-                    # Compute Jacobian
-                    jacobian = self.polytope_computer.compute_jacobian(
-                        hip_angle, knee_angle, ankle_angle,
-                        self.leg_model.thigh_length,
-                        self.leg_model.shank_length
-                    )
-
-                    # Compute polytope
-                    vertices = self.polytope_computer.compute_polytope(
-                        moment_arms, muscle_forces, jacobian, selected_muscles
-                    )
-
-                    # Plot polytope
-                    if len(vertices) > 2:
-                        polygon = Polygon(vertices, alpha=0.3, facecolor='blue',
-                                        edgecolor='blue', linewidth=2)
-                        ax_polytope_export.add_patch(polygon)
-                        ax_polytope_export.plot(vertices[:, 0], vertices[:, 1],
-                                              'bo', markersize=4)
-
-                    # Frailty threshold
-                    body_weight = self.data.segment_lengths['subject_mass'] * 9.81
-                    threshold = body_weight * self.data.config['frailty']['threshold_multiplier']
-
-                    ax_polytope_export.axhline(y=threshold, color='red',
-                                             linestyle='--', linewidth=2,
-                                             label=f'Frailty Threshold ({threshold:.0f} N)')
-                    ax_polytope_export.legend()
-
-                plt.tight_layout()
-
-            # Create animation
-            anim = FuncAnimation(export_fig, animate, frames=self.n_frames,
-                               interval=33, repeat=False)
-
-            # Save animation
-            if file_ext == '.gif':
-                writer = PillowWriter(fps=20)
-                anim.save(filename, writer=writer)
-            else:  # .mp4 or others
-                try:
-                    writer = FFMpegWriter(fps=20, bitrate=2000)
-                    anim.save(filename, writer=writer)
-                except Exception as e:
-                    # Fallback to Pillow if FFmpeg not available
-                    messagebox.showwarning(
-                        "FFmpeg Not Available",
-                        "FFmpeg not found. Saving as GIF instead.\n" +
-                        "Install FFmpeg for MP4 export."
-                    )
-                    gif_filename = str(Path(filename).with_suffix('.gif'))
-                    writer = PillowWriter(fps=20)
-                    anim.save(gif_filename, writer=writer)
-                    filename = gif_filename
-
-            plt.close(export_fig)
-
-            # Success message
-            self.export_status.config(text="Export complete!")
-            messagebox.showinfo("Export Complete",
-                              f"Video saved to:\n{filename}")
-
-        except Exception as e:
-            messagebox.showerror("Export Error",
-                               f"Failed to export video:\n{str(e)}")
-            self.export_status.config(text="Export failed")
-
-        finally:
-            # Re-enable controls
-            self.is_exporting = False
-            self.export_btn.config(state='normal')
-            # Clear status after 3 seconds
-            self.root.after(3000, lambda: self.export_status.config(text=""))
-
-    def update_visualization(self):
-        """Update all visualizations based on current state"""
-
-        # Save current view limits before clearing
-        self.current_leg_xlim = list(self.ax_leg.get_xlim())
-        self.current_leg_ylim = list(self.ax_leg.get_ylim())
-        self.current_polytope_xlim = list(self.ax_polytope.get_xlim())
-        self.current_polytope_ylim = list(self.ax_polytope.get_ylim())
-
-        # Get current data
-        row = self.data.kinematics.iloc[self.current_frame]
-        time_val = row[self.time_col]
-        hip_angle = row['hip_angle']
-        knee_angle = row['knee_angle']
-        ankle_angle = row['ankle_angle']
-        phase = row['phase']
-
-        # Update labels with proper formatting
-        if self.time_col == 'gait_percent':
-            self.time_label.config(text=f"Gait Cycle: {time_val:.1f}%")
-        else:
-            self.time_label.config(text=f"Time: {time_val:.3f} s")
-        self.phase_label.config(text=f"Phase: {phase.replace('_', ' ').title()}")
-
-        # Get selected muscles
-        selected_muscles = [m for m, var in self.muscle_vars.items()
-                          if var.get()]
-
-        # === UPDATE LEG SKELETON ===
-        self.ax_leg.clear()
-        self.ax_leg.set_aspect('equal')
-        self.ax_leg.set_xlabel('X (m)')
-        self.ax_leg.set_ylabel('Y (m)')
-        self.ax_leg.set_title('Leg Posture (Sagittal Plane)')
-        self.ax_leg.grid(True, alpha=0.3)
-
-        # Compute joint positions
-        hip, knee, ankle, toe = self.leg_model.compute_positions(
-            hip_angle, knee_angle, ankle_angle
-        )
-
-        # Draw ground
-        self.ax_leg.plot([-0.8, 0.8], [-1.0, -1.0], 'k-', linewidth=2)
-        self.ax_leg.fill_between([-0.8, 0.8], [-1.0, -1.0], [-1.3, -1.3],
-                                color='gray', alpha=0.3)
-
-        # Draw skeleton
-        # Thigh
-        self.ax_leg.plot([hip[0], knee[0]], [hip[1], knee[1]],
-                        'o-', color='#2E4057', linewidth=4, markersize=8,
-                        label='Thigh')
-        # Shank
-        self.ax_leg.plot([knee[0], ankle[0]], [knee[1], ankle[1]],
-                        'o-', color='#048A81', linewidth=4, markersize=8,
-                        label='Shank')
-        # Foot
-        self.ax_leg.plot([ankle[0], toe[0]], [ankle[1], toe[1]],
-                        'o-', color='#54C6EB', linewidth=4, markersize=8,
-                        label='Foot')
-
-        # Draw muscles (simplified representation)
-        activations = self.data.activations.iloc[self.current_frame]
-
-        for muscle in selected_muscles:
-            if muscle in activations:
-                activation = activations[muscle]
-
-                # Determine muscle attachment points (simplified)
-                if 'glut' in muscle or 'iliacus' in muscle or 'add' in muscle:
-                    # Hip muscles
-                    start = hip + np.array([-0.05, 0.05])
-                    end = (hip + knee) / 2
-                elif 'biceps' in muscle or 'semi' in muscle:
-                    # Hamstrings
-                    start = (hip + knee) / 2
-                    end = knee
-                elif 'gastroc' in muscle or 'soleus' in muscle:
-                    # Calf
-                    start = knee
-                    end = ankle
-                elif 'tib' in muscle or 'peron' in muscle:
-                    # Ankle muscles
-                    start = knee
-                    end = ankle
-                else:
-                    continue
-
-                # Draw muscle line
-                alpha = 0.3 + 0.7 * activation
-                linewidth = 1 + 3 * activation
-
-                self.ax_leg.plot([start[0], end[0]], [start[1], end[1]],
-                               color='red', alpha=alpha, linewidth=linewidth)
-
-        # Labels
-        self.ax_leg.text(hip[0]-0.1, hip[1]+0.05, 'Hip', fontsize=9)
-        self.ax_leg.text(knee[0]-0.1, knee[1]+0.05, 'Knee', fontsize=9)
-        self.ax_leg.text(ankle[0]-0.1, ankle[1]+0.05, 'Ankle', fontsize=9)
-
-        # Restore view limits for leg plot
-        self.ax_leg.set_xlim(self.current_leg_xlim)
-        self.ax_leg.set_ylim(self.current_leg_ylim)
-
-        # === UPDATE FORCE POLYTOPE ===
-        self.ax_polytope.clear()
-        self.ax_polytope.set_xlabel('Horizontal Force Fx (N)')
-        self.ax_polytope.set_ylabel('Vertical Force Fy (N)')
-        self.ax_polytope.set_title('Feasible Force Polytope')
-        self.ax_polytope.grid(True, alpha=0.3)
-        self.ax_polytope.axhline(y=0, color='k', linewidth=0.5)
-        self.ax_polytope.axvline(x=0, color='k', linewidth=0.5)
-
-        if len(selected_muscles) > 0:
-            # Get moment arms
-            moment_arms = self.get_moment_arms(self.current_frame)
-
-            # Get max forces
-            muscle_forces = {}
-            for muscle in selected_muscles:
-                muscle_forces[muscle] = self.data.muscles.loc[muscle, 'F0_max']
-
-            # Compute Jacobian
-            jacobian = self.polytope_computer.compute_jacobian(
-                hip_angle, knee_angle, ankle_angle,
-                self.leg_model.thigh_length,
-                self.leg_model.shank_length
-            )
-
-            # Compute polytope
-            vertices = self.polytope_computer.compute_polytope(
-                moment_arms, muscle_forces, jacobian, selected_muscles
-            )
-
-            # Plot polytope
-            if len(vertices) > 2:
-                polygon = Polygon(vertices, alpha=0.3, facecolor='blue',
-                                edgecolor='blue', linewidth=2)
-                self.ax_polytope.add_patch(polygon)
-
-                # Plot vertices
-                self.ax_polytope.plot(vertices[:, 0], vertices[:, 1],
-                                    'bo', markersize=4)
-
-            # Frailty threshold
-            body_weight = self.data.segment_lengths['subject_mass'] * 9.81
-            threshold = body_weight * self.data.config['frailty']['threshold_multiplier']
-
-            self.ax_polytope.axhline(y=threshold, color='red',
-                                    linestyle='--', linewidth=2,
-                                    label=f'Frailty Threshold ({threshold:.0f} N)')
-
-            self.ax_polytope.legend()
-
-        # Restore view limits for polytope plot
-        self.ax_polytope.set_xlim(self.current_polytope_xlim)
-        self.ax_polytope.set_ylim(self.current_polytope_ylim)
-
-        # === UPDATE INFO TEXT ===
-        self.info_text.delete(1.0, tk.END)
-
-        # Format time/gait display
-        if self.time_col == 'gait_percent':
-            time_display = f"Gait Cycle: {time_val:.1f}%"
-        else:
-            time_display = f"Time: {time_val:.3f} s"
-
-        info = f"""
-Frame: {self.current_frame}/{self.n_frames-1}
-{time_display}
-Phase: {phase}
-
-Joint Angles:
-  Hip:   {hip_angle:6.1f}°
-  Knee:  {knee_angle:6.1f}°
-  Ankle: {ankle_angle:6.1f}°
-
-Muscles: {len(selected_muscles)}/{len(self.muscle_names)}
-"""
-        self.info_text.insert(1.0, info)
-
-        # Redraw canvas
+            self.ax_poly_ref = self.fig.add_subplot(self.gs[1])
+            self.ax_poly_ref.set_xlabel("Fx (N)")
+            self.ax_poly_ref.set_ylabel("Fy (N)")
+            self.ax_poly_ref.set_title("Feasible Force Set (2D)")
+            self.ax_poly_ref.grid(True)
+            self.ax_poly_ref.axhline(0, color='k', lw=0.5)
+            self.ax_poly_ref.axvline(0, color='k', lw=0.5)
+            lim = 2000
+            self.ax_poly_ref.set_xlim(-lim, lim)
+            self.ax_poly_ref.set_ylim(-lim, lim)
+
+            self.artists['poly']['patch'] = Polygon([[0, 0]], closed=True, fc='cornflowerblue', alpha=0.4, ec='blue')
+            self.ax_poly_ref.add_patch(self.artists['poly']['patch'])
+            self.artists['poly']['verts_2d'], = self.ax_poly_ref.plot([], [], 'b.', ms=4)
+            self.artists['demand']['dot'], = self.ax_poly_ref.plot([], [], 'ro', ms=8, zorder=5)
+            self.artists['demand']['ray'], = self.ax_poly_ref.plot([], [], 'r--', alpha=0.5, lw=1.5)
+
+        # RECREATE TOOLBAR so the Home button knows about the new axes
+        self._create_toolbar()
+
+        self.fig.tight_layout()
         self.canvas.draw()
 
-
-def generate_sample_data():
-    """Generate sample data files with actual moment arm matrix values"""
-
-    data_path = Path("data")
-
-    # Remove existing data directory if it exists
-    if data_path.exists():
-        import shutil
-        shutil.rmtree(data_path)
-
-    # Create fresh directories
-    data_path.mkdir(exist_ok=True)
-    (data_path / "muscle_data").mkdir(exist_ok=True)
-    (data_path / "moment_arms").mkdir(exist_ok=True)
-    (data_path / "kinematics").mkdir(exist_ok=True)
-
-    print("Generating sample data files with actual moment arm matrix...")
-
-    # ACTUAL MOMENT ARM MATRIX - Only these 14 muscles
-    muscles = [
-        'iliacus', 'glut_max', 'glut_med', 'add_long',
-        'biceps_fem_lh', 'biceps_fem_sh', 'semitend', 'semimem',
-        'tib_ant', 'peron_brev',
-        'gastroc_med', 'gastroc_lat', 'soleus', 'tib_post'
-    ]
-
-    # Actual signed moment arm values from the matrix (in meters)
-    # Format: [hip, knee, ankle] for each muscle
-    actual_moment_arms = {
-        'iliacus':       [+0.0150, +0.0000, +0.0000],
-        'glut_max':      [-0.0198, +0.0000, +0.0000],
-        'glut_med':      [+0.0235, +0.0000, +0.0000],
-        'add_long':      [0.0000, +0.0000, +0.0000],  # NA in original, using 0.0
-        'biceps_fem_lh': [-0.0366, +0.0306, +0.0000],
-        'biceps_fem_sh': [+0.0000, +0.0325, +0.0000],
-        'semitend':      [-0.0408, +0.0412, +0.0000],
-        'semimem':       [-0.0380, +0.0363, +0.0000],
-        'tib_ant':       [+0.0000, -0.0170, +0.0170],
-        'peron_brev':    [+0.0000, -0.0113, +0.0113],
-        'gastroc_med':   [+0.0000, -0.0389, +0.0241],
-        'gastroc_lat':   [+0.0000, -0.0386, +0.0254],
-        'soleus':        [+0.0000, +0.0000, +0.0219],
-        'tib_post':      [+0.0000, +0.0000, +0.0081]
-    }
-
-    muscle_params = pd.DataFrame({
-        'muscle_name': muscles,
-        'F0_max': [1000, 1500, 800, 600, 900, 600, 900, 1100,
-                   1200, 500, 1600, 1400, 4000, 1400],
-        'optimal_fiber_length': [0.10, 0.14, 0.09, 0.11, 0.11, 0.10,
-                                0.20, 0.08, 0.10, 0.05, 0.05, 0.06, 0.03, 0.03],
-        'tendon_slack_length': [0.09, 0.13, 0.08, 0.10, 0.34, 0.10,
-                               0.26, 0.35, 0.22, 0.16, 0.41, 0.39, 0.27, 0.31],
-        'pennation_angle': [0.13, 0.09, 0.15, 0.10, 0.00, 0.40,
-                           0.09, 0.26, 0.09, 0.09, 0.30, 0.15, 0.44, 0.21],
-        'PCSA': [45, 65, 35, 28, 32, 25, 33, 40, 42, 18,
-                 58, 52, 140, 48]
-    })
-    muscle_params.set_index('muscle_name', inplace=True)
-    muscle_params.to_csv(data_path / "muscle_data" / "muscle_parameters.csv")
-    print(f"✓ Created muscle_parameters.csv with {len(muscles)} muscles")
-
-    # Generate normalized gait cycle (0-100%, 101 samples for 0, 1, 2, ... 100%)
-    n_samples = 101
-    gait_percent = np.linspace(0, 100, n_samples)
-
-    # Joint angles for stair climbing
-    # Based on biomechanics literature (Protopapadaki et al. 2007, Reeves et al. 2009)
-    gait_norm = gait_percent / 100.0
-
-    # Divide gait cycle into phases
-    # Stance: 0-60%, Swing: 60-100%
-    stance_phase = gait_norm < 0.6
-    swing_phase = gait_norm >= 0.6
-
-    # Initialize arrays
-    hip_angles = np.zeros_like(gait_norm)
-    knee_angles = np.zeros_like(gait_norm)
-    ankle_angles = np.zeros_like(gait_norm)
-
-    for i, t in enumerate(gait_norm):
-        if t < 0.1:  # Heel strike (0-10%): foot contacts next step
-            hip_angles[i] = 30 + 10 * (t / 0.1)  # 30-40° flexion
-            knee_angles[i] = 70 + 10 * (t / 0.1)  # 70-80° flexion
-            ankle_angles[i] = 5 * (t / 0.1)  # 0-5° dorsiflexion
-
-        elif t < 0.25:  # Loading response (10-25%): weight acceptance
-            progress = (t - 0.1) / 0.15
-            hip_angles[i] = 40 - 5 * progress  # 40-35° (slight extension)
-            knee_angles[i] = 80 - 20 * progress  # 80-60° (controlled lowering)
-            ankle_angles[i] = 5 - 10 * progress  # 5 to -5° plantarflexion
-
-        elif t < 0.45:  # Mid-stance (25-45%): body rises over foot
-            progress = (t - 0.25) / 0.20
-            hip_angles[i] = 35 - 20 * progress  # 35-15° (extending)
-            knee_angles[i] = 60 - 30 * progress  # 60-30° (extending)
-            ankle_angles[i] = -5 + 10 * progress  # -5 to +5° dorsiflexion
-
-        elif t < 0.60:  # Terminal stance/Push-off (45-60%): propulsion
-            progress = (t - 0.45) / 0.15
-            hip_angles[i] = 15 - 10 * progress  # 15-5° (nearly upright)
-            knee_angles[i] = 30 - 20 * progress  # 30-10° (nearly straight)
-            ankle_angles[i] = 5 - 30 * progress  # +5 to -25° (strong plantarflexion)
-
-        elif t < 0.75:  # Initial swing (60-75%): leg lifts off, starts forward
-            progress = (t - 0.60) / 0.15
-            hip_angles[i] = 5 + 20 * progress  # 5-25° (rapid flexion)
-            knee_angles[i] = 10 + 60 * progress  # 10-70° (rapid flexion)
-            ankle_angles[i] = -25 + 30 * progress  # -25 to +5° (return to neutral)
-
-        else:  # Terminal swing (75-100%): leg reaches forward to next step
-            progress = (t - 0.75) / 0.25
-            hip_angles[i] = 25 + 10 * progress  # 25-35° (continue flexion)
-            knee_angles[i] = 70 + 5 * progress  # 70-75° (maintain flexion)
-            ankle_angles[i] = 5 - 5 * progress  # +5 to 0° (prepare for contact)
-
-    # Phase labels based on gait percentage
-    phases = []
-    for pct in gait_percent:
-        if pct < 15:
-            phases.append('heel_strike')
-        elif pct < 30:
-            phases.append('loading')
-        elif pct < 60:
-            phases.append('mid_stance')
-        elif pct < 80:
-            phases.append('push_off')
-        else:
-            phases.append('swing')
-
-    kinematics = pd.DataFrame({
-        'gait_percent': gait_percent,
-        'hip_angle': hip_angles,
-        'knee_angle': knee_angles,
-        'ankle_angle': ankle_angles,
-        'phase': phases
-    })
-    kinematics.to_csv(data_path / "kinematics" / "joint_angles.csv", index=False)
-    print(f"✓ Created joint_angles.csv (normalized 0-100%)")
-
-    # Segment lengths
-    segments = {
-        'thigh_length': 0.45,
-        'shank_length': 0.43,
-        'foot_length': 0.25,
-        'subject_mass': 75.0,
-        'subject_height': 1.75
-    }
-    segment_file = data_path / "kinematics" / "segment_lengths.json"
-    with open(segment_file, 'w') as f:
-        json.dump(segments, f, indent=2)
-    with open(segment_file, 'r') as f:
-        verify = f.read()
-    print(f"✓ Created segment_lengths.json ({len(verify)} bytes)")
-
-    # Generate moment arms using ACTUAL VALUES from matrix
-    # Since we have constant values, we replicate them across all gait cycle points
-    ma_data = []
-    for pct in gait_percent:
-        for muscle in muscles:
-            ma_values = actual_moment_arms[muscle]
-            ma_data.append({
-                'gait_percent': pct,
-                'muscle': muscle,
-                'hip_moment_arm': ma_values[0],
-                'knee_moment_arm': ma_values[1],
-                'ankle_moment_arm': ma_values[2]
-            })
-
-    ma_df = pd.DataFrame(ma_data)
-    ma_df.to_csv(data_path / "moment_arms" / "moment_arm_matrix.csv", index=False)
-    print(f"✓ Created moment_arm_matrix.csv with ACTUAL signed values")
-
-    # Generate activations (simplified patterns)
-    activation_data = {'gait_percent': gait_percent}
-    for muscle in muscles:
-        if 'glut' in muscle or 'soleus' in muscle or 'gastroc' in muscle:
-            # High during stance
-            activation_data[muscle] = 0.2 + 0.6 * (np.sin(2*np.pi*gait_norm - np.pi/2) + 1) / 2
-        elif 'iliacus' in muscle or 'tib_ant' in muscle:
-            # High during swing
-            activation_data[muscle] = 0.1 + 0.5 * (np.sin(2*np.pi*gait_norm + np.pi/2) + 1) / 2
-        elif 'biceps' in muscle or 'semi' in muscle:
-            # Hamstrings - high during loading and push-off
-            activation_data[muscle] = 0.2 + 0.5 * (np.sin(2*np.pi*gait_norm - np.pi/3) + 1) / 2
-        else:
-            activation_data[muscle] = 0.1 + 0.3 * np.random.rand(n_samples)
-
-    activations = pd.DataFrame(activation_data)
-    activations.to_csv(data_path / "muscle_data" / "activation_timeseries.csv",
-                      index=False)
-    print(f"✓ Created activation_timeseries.csv")
-
-    # Generate forces
-    force_data = {'gait_percent': gait_percent}
-    for muscle in muscles:
-        f_max = muscle_params.loc[muscle, 'F0_max']
-        force_data[muscle] = activation_data[muscle] * f_max
-
-    forces = pd.DataFrame(force_data)
-    forces.to_csv(data_path / "muscle_data" / "muscle_forces.csv", index=False)
-    print(f"✓ Created muscle_forces.csv")
-
-    # Config file with updated muscle groups
-    config = {
-        'visualization': {
-            'figure_width': 14,
-            'figure_height': 8,
-            'animation_fps': 20
-        },
-        'muscles': {
-            'groups': {
-                'hip_extensors': ['glut_max', 'biceps_fem_lh', 'semitend', 'semimem'],
-                'hip_flexors': ['iliacus'],
-                'hip_stabilizers': ['glut_med', 'add_long'],
-                'knee_extensors': ['biceps_fem_sh'],
-                'calf': ['gastroc_med', 'gastroc_lat', 'soleus'],
-                'ankle_stabilizers': ['tib_ant', 'tib_post', 'peron_brev']
-            }
-        },
-        'frailty': {
-            'threshold_multiplier': 1.1
-        },
-        'colors': {
-            'hip_extensors': '#8B0000',
-            'hip_flexors': '#228B22',
-            'hip_stabilizers': '#9932CC',
-            'knee_extensors': '#FFD700',
-            'calf': '#4169E1',
-            'ankle_stabilizers': '#FF8C00'
-        },
-        'gait_cycle': {
-            'description': 'Data normalized to 0-100% gait cycle',
-            'note': 'Moment arms from actual experimental data with signs'
+    def refresh_muscle_list(self):
+        for widget in self.scroll_frame.winfo_children(): widget.destroy()
+        self.chk_vars = {}
+        indices = self.d.get_muscle_indices(self.var_subset.get())
+        groups = {
+            "Hip / Pelvis": ["glut", "ili", "pso", "gem", "pir", "add", "pect", "quad_fem", "obt"],
+            "Knee / Thigh": ["vas", "rec", "bic", "sem", "gra", "sar", "ten_fas"],
+            "Ankle / Foot": ["tib", "gas", "sol", "per", "fle", "ext"],
         }
-    }
+        sorted_groups = {k: [] for k in groups};
+        sorted_groups["Other"] = []
+        for idx in indices:
+            name = self.d.muscle_names[idx].lower()
+            placed = False
+            for group, keywords in groups.items():
+                if any(k in name for k in keywords):
+                    sorted_groups[group].append(idx);
+                    placed = True;
+                    break
+            if not placed: sorted_groups["Other"].append(idx)
+        for group_name, group_indices in sorted_groups.items():
+            if not group_indices: continue
+            ttk.Label(self.scroll_frame, text=f"--- {group_name} ---", font=("Arial", 9, "bold")).pack(anchor="w",
+                                                                                                       pady=(5, 2))
+            for idx in group_indices:
+                name = self.d.muscle_names[idx]
+                var = tk.BooleanVar(value=True)
+                self.chk_vars[idx] = var
+                cb = ttk.Checkbutton(self.scroll_frame, text=name, variable=var, command=self.on_param_change)
+                cb.pack(anchor="w", padx=15)
+        self.on_param_change()
 
-    with open(data_path / "config.yaml", 'w') as f:
-        yaml.dump(config, f, default_flow_style=False)
-    print(f"✓ Created config.yaml")
+    def select_all(self):
+        for v in self.chk_vars.values(): v.set(True)
+        self.on_param_change()
 
-    print("\n✓ Sample data generated successfully with ACTUAL moment arm matrix!")
-    print(f"  Using {len(muscles)} muscles with signed moment arm values")
-    print("  All datasets use gait_percent (0-100%)")
+    def select_none(self):
+        for v in self.chk_vars.values(): v.set(False)
+        self.on_param_change()
 
+    def on_mode_change(self):
+        self.plot_mode = self.var_mode.get()
+        self._reset_poly_axes()
+        self.update_frame(self.frame)
 
-def main():
-    """Main entry point"""
+    def on_param_change(self):
+        self.update_frame(self.frame)
 
-    # Check if data exists and is complete
-    data_loader = DataLoader("data")
-    files_ok, missing = data_loader.check_files_exist()
+    def on_slider(self, val):
+        self.frame = int(float(val))
+        self.update_frame(self.frame)
 
-    if not files_ok:
-        print("Missing or empty data files:")
-        for f in missing:
-            print(f"  - {f}")
-        print("\nGenerating sample data with actual moment arm matrix...")
-        generate_sample_data()
-        print("")
+    def toggle_play(self):
+        self.is_playing = not self.is_playing
+        self.btn_play.config(text="|| Pause" if self.is_playing else "▶ Play")
+        if self.is_playing: self.animate()
 
-    # Load data
-    try:
-        data_loader.load_all()
-    except Exception as e:
-        print(f"\n✗ Error loading data: {e}")
-        print("\nRegenerating sample data...")
-        generate_sample_data()
-        data_loader = DataLoader("data")
-        data_loader.load_all()
+    def animate(self):
+        if not self.is_playing: return
+        self.frame = (self.frame + 1) % 120
+        self.slider.set(self.frame)
+        speed = self.speed_var.get()
+        delay = int(40 / speed) if speed > 0 else 40
+        self.root.after(delay, self.animate)
 
-    # Create GUI
-    root = tk.Tk()
-    app = StairClimbingGUI(root, data_loader)
+    def update_frame(self, f):
+        self.lbl_frame.config(text=str(f))
 
-    # Run
-    print("\n" + "="*60)
-    print("GUI Started Successfully!")
-    print("="*60)
+        # 1. Kinematics (Updated Hierarchical Logic)
+        kin = self.eng.get_kinematic_chain(f)
+        p_hip = kin['p_hip']
+        p_knee = kin['p_knee']
+        p_ankle = kin['p_ankle']
+        p_toe = kin['p_toe']
 
-    # Show which format is being used
-    if data_loader.time_col == 'gait_percent':
-        print("\nData Format: Normalized Gait Cycle (0-100%)")
-        print("  ✓ Compatible with multi-source data")
-        print("  ✓ Speed-independent analysis")
-    else:
-        print("\nData Format: Absolute Time (seconds)")
-        print("  ℹ Consider normalizing to gait cycle % for multi-source data")
+        self.artists['leg']['thigh'].set_data([p_hip[0], p_knee[0]], [p_hip[1], p_knee[1]])
+        self.artists['leg']['shank'].set_data([p_knee[0], p_ankle[0]], [p_knee[1], p_ankle[1]])
+        self.artists['leg']['foot'].set_data([p_ankle[0], p_toe[0]], [p_ankle[1], p_toe[1]])
 
-    print("\nMuscles included (from actual moment arm matrix):")
-    for i, muscle in enumerate(data_loader.muscles.index, 1):
-        print(f"  {i:2d}. {muscle}")
+        # 2. Polytope
+        active_indices = [idx for idx, v in self.chk_vars.items() if v.get()]
+        res = self.eng.compute_polytope(f, active_indices, self.plot_mode)
 
-    print("\nControls:")
-    print("  - Use slider to navigate through the motion")
-    print("  - Check/uncheck muscles to see their contribution")
-    print("  - Click Play to animate")
-    print("  - Adjust speed with dropdown")
-    print("  - Use toolbar buttons to pan/zoom plots")
-    print("  - Zoom/pan persists during animation")
-    print("  - Click 'Export Video' to save animation")
-    print("\nClose window to exit.")
-    print("="*60 + "\n")
+        # Demand (Torque)
+        tau = self.d.tau_demand[:, f]  # Hip, Knee, Ankle
 
-    root.mainloop()
+        if self.plot_mode == 'torque':
+            points, hull = res
+
+            if hull is not None:
+                verts = points[hull.vertices]
+                self.artists['poly']['verts_3d']._offsets3d = (verts[:, 0], verts[:, 1], verts[:, 2])
+
+                if self.artists['poly']['edges_3d']:
+                    self.artists['poly']['edges_3d'].remove()
+
+                edges = []
+                for s in hull.simplices:
+                    s = np.append(s, s[0])
+                    edges.append(points[s])
+
+                edge_col = Poly3DCollection(edges, alpha=0.1, facecolor='cyan', edgecolor='blue')
+                self.artists['poly']['edges_3d'] = self.ax_poly_ref.add_collection3d(edge_col)
+            else:
+                self.artists['poly']['verts_3d']._offsets3d = ([], [], [])
+
+            self.artists['demand']['ray_3d'].set_data_3d([0, tau[0]], [0, tau[1]], [0, tau[2]])
+            self.artists['demand']['dot_3d'].set_data_3d([tau[0]], [tau[1]], [tau[2]])
+
+        else:  # Force Mode
+            verts = res
+            if len(verts) > 0:
+                self.artists['poly']['patch'].set_xy(verts)
+                self.artists['poly']['verts_2d'].set_data(verts[:, 0], verts[:, 1])
+
+            # Map Torque -> Force using Correct Jacobian
+            J = self.eng.get_force_jacobian(f)
+            try:
+                # F = (J^T)+ * tau
+                f_demand = np.linalg.pinv(J.T) @ tau
+                dx, dy = f_demand[0], f_demand[1]
+            except:
+                dx, dy = 0, 0
+
+            self.artists['demand']['dot'].set_data([dx], [dy])
+            self.artists['demand']['ray'].set_data([0, dx], [0, dy])
+
+        self.canvas.draw_idle()
+
+    def export_gif(self):
+        file_path = filedialog.asksaveasfilename(defaultextension=".gif", filetypes=[("GIF", "*.gif")])
+        if not file_path: return
+        self.is_playing = False
+        messagebox.showinfo("Export", "Generating GIF... Please wait (UI will freeze).")
+
+        def update_anim(frame_idx):
+            self.frame = frame_idx
+            self.update_frame(frame_idx)
+
+        anim = FuncAnimation(self.fig, update_anim, frames=range(0, 120, 2), blit=False)
+        try:
+            anim.save(file_path, writer=PillowWriter(fps=15))
+            messagebox.showinfo("Success", "GIF Saved Successfully!")
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
 
 
 if __name__ == "__main__":
-    main()
+    if not os.path.exists("data"):
+        print("Error: 'data' folder not found.")
+        sys.exit(1)
+    root = tk.Tk()
+    dm = DataManager("data")
+    try:
+        dm.load_data()
+        if dm.is_ready:
+            app = NeuromechApp(root, dm)
+            root.mainloop()
+    except Exception as e:
+        messagebox.showerror("Crash", f"Critical Error Loading Data:\n{str(e)}")
+        raise e
