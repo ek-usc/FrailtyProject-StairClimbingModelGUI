@@ -13,7 +13,7 @@ The deterministic results from the GUI strongly validated the sensitivity analys
 
 ![GUI polytope comparison](https://github.com/ek-usc/Frailty_Project-Feasible_Torque_and_Force_Sets_Neuromechanics_GUI/blob/master/figures/polytope_comparisons.png)
 
-FTS/FFS Comparison: Displays FTS/FFS with all muscles included (left), only soleus excluded (left center), only medial gastrocnemius excluded (right center), medial and lateral gastrocnemius, soleus, tibialis posterior, flexor digitorum, and flexor hallucis excluded (right); drastic shrinkage supports Monte Carlo sensitivity analysis—soleus and other plantar flexor muscles are most critical 
+FTS/FFS Comparison (click on image to expand): Displays FTS/FFS with all muscles included (left), only soleus excluded (left center), only medial gastrocnemius excluded (right center), medial and lateral gastrocnemius, soleus, tibialis posterior, flexor digitorum, and flexor hallucis excluded (right); drastic shrinkage supports Monte Carlo sensitivity analysis—soleus and other plantar flexor muscles are most critical 
 
 
 ![GUI preview](https://github.com/ek-usc/FrailtyProject-StairClimbingModelGUI/blob/master/figures/frailtyGUI.png)
