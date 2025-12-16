@@ -1,14 +1,33 @@
+# This CITATION.cff file was generated with cffinit.
+# Visit https://bit.ly/cffinit to generate yours today!
+
 cff-version: 1.2.0
-message: "If you use this software, please cite it as below."
+title: Feasible Torque/Force Sets Neuromechanics GUI
+message: >-
+  If you use this software, please cite it using the
+  metadata from this file.
+type: software
 authors:
-- family-names: "YOUR_NAME_HERE"
-  given-names: "YOUR_NAME_HERE"
-  orcid: "https://orcid.org/0000-0000-0000-0000"
-- family-names: "Lisa"
-  given-names: "Mona"
-  orcid: "https://orcid.org/0000-0000-0000-0000"
-title: "FrailtyProject-StairClimbingModelGUI"
-version: 1.0.0
-doi: 10.5281/zenodo.1234
-date-released: 2025-12-15
-url: "https://github.com/ek-usc/FrailtyProject-StairClimbingModelGUI"
+  - given-names: Eric
+    family-names: Kwei
+repository-code: >-
+  https://github.com/ek-usc/FrailtyProject-StairClimbingModelGUI/tree/master
+abstract: >-
+  To complement the probabilistic Monte Carlo simulations,
+  we developed a Python-based, interactive GUI to
+  deterministically visualize the evolution of mechanical
+  feasibility throughout the stair ascent cycle. This tool
+  integrates posture-dependent moment arms and muscle force
+  capacities to compute the Feasible Torque Set (FTS) in 3D
+  joint space and projects it into the Feasible Force Set
+  (FFS) using the pseudo-inverted, transposed, kinematic
+  Jacobian. By calculating the Minkowski sum of active
+  muscle generators, the GUI defines the absolute
+  theoretical limits of force production for a specific
+  subject model at every frame of the ascent cycle. This
+  platform served as a "virtual laboratory" to test the
+  robustness of the limb by selectively deactivating muscles
+  to simulate severe focal sarcopenia, directly addressing
+  the research question of identifying the most critical
+  muscles for stair ascent.
+license: GPL-3.0
