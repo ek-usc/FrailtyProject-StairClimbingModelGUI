@@ -19,3 +19,8 @@ FTS/FFS Comparison: Displays FTS/FFS with all muscles included (left), only sole
 ![GUI preview](https://github.com/ek-usc/FrailtyProject-StairClimbingModelGUI/blob/master/figures/frailtyGUI.png)
 
 Preview of GUI
+
+# Acknowledgements:
+Gemini 3 Pro was used to provide a workflow framework and assist with coding.  
+
+Initial prompt: "[We are] trying to model the human lower limb to study the diminishing feasible output forces and parameters as a person grows elderly, framing the problem in the context of what [we] learned in class. . . about torque, force, and muscle activation spaces. Also attached is a pdf compiling [our] research notes, resources, and tasks. Describe thoroughly, the GUI producer's role, and outline their workflow steps: "The other to write a script to visualize the output-figures to a video (for example, make a GUI, Users can choose muscles they interested in, then by dragging the progress bar, users can choose each leg posture, and corresponding feasible force set will appear next to the posture)." Make sure to also describe the required input parameters that the script will accept and read, before producing the user-interactive GUI. Also consider some useful, extra features for the GUI." 
